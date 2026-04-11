@@ -121,7 +121,7 @@ MISSION_LOCK = threading.Lock()
 
 @dataclass
 class MissionState:
-    mode: str = "auto_traj"   # auto_traj / hold / goto / inspect / rth
+    mode: str = "auto_traj"   # auto_traj / hold / goto / inspect / rth / traj
     frame: str = "local"      # local / body / none
     policy: str = "normal"    # normal / energy_saving / smooth / fast / safe
 
@@ -132,6 +132,9 @@ class MissionState:
 
     hold_time: float = 0.0
     hold_start_time: float = 0.0
+    
+    traj_type: str = ""
+    traj_param: float = 10.0
 
     active: bool = False
     source_text: str = ""
@@ -153,34 +156,42 @@ mission_runtime_state = {
 # 3. Z 軸與 XY 軸控制器
 # ==========================================
 class Altitude_ETM_Controller:
+    """
+    無人機高度 (Z軸) 的事件觸發機制 (ETM) 控制器。
+    基於給定目標高度計算追蹤誤差，並在網路通訊誤差超過門檻才觸發新的控制指令傳送，
+    以減少不必要的通訊負載。
+    """
     def __init__(self):
-        self.last_sent_state = np.zeros(2, dtype=float)
-        self.last_control_u = 0.0
-        self.ref_state = np.zeros(2, dtype=float)
+        self.last_sent_state = np.zeros(2, dtype=float)  # 上次傳送的高度狀態 [z, vz]
+        self.last_control_u = 0.0                       # 上次計算的控制輸出
+        self.ref_state = np.zeros(2, dtype=float)       # 參考模型狀態
         self.prev_time = time.time()
         self.ref_state[0] = 0.0
         self.first_run = True
 
     def update_reference(self, dt, target_height):
+        # 計算參考模型演進，產生平滑的高度追蹤曲線
         r_input = np.array([0.0, 4.0 * target_height], dtype=float)
         dx_r = AR_ALT @ self.ref_state + r_input
         self.ref_state += dx_r * dt
         return self.ref_state
 
     def compute_control(self, current_state, target_height):
+        # 根據系統當前狀態計算 ETM 控制輸出，並返回是否觸發事件的布林值
         current_time = time.time()
         dt = current_time - self.prev_time
         dt = float(np.clip(dt, DT_MIN, DT_MAX))
         self.prev_time = current_time
 
         xr = self.update_reference(dt, target_height)
-        e_trk = current_state - xr
-        e_net = self.last_sent_state - current_state
+        e_trk = current_state - xr                      # 追蹤誤差
+        e_net = self.last_sent_state - current_state      # 網路狀態偏差
 
         term_net = float(e_net.T @ OMEGA_ALT @ e_net)
         term_trk = float(e_trk.T @ OMEGA_ALT @ e_trk)
 
         triggered = False
+        # 判斷是否滿足事件觸發條件
         if self.first_run or (term_net > SIGMA_ALT * term_trk):
             triggered = True
             self.first_run = False
@@ -194,6 +205,11 @@ class Altitude_ETM_Controller:
 
 
 class Fuzzy_ETM_Core:
+    """
+    無人機水平控制 (X 與 Y 軸) 的模糊事件觸發核心機制。
+    結合死區(deadzone)與軟變數(soft_scale)，以及模糊增益表 (w1*F1 + w2*F2)，
+    在減少通訊次數的同時改善誤差震盪問題。
+    """
     def __init__(
         self,
         omega,
@@ -227,6 +243,7 @@ class Fuzzy_ETM_Core:
         self.last_trigger_time = 0.0
 
     def get_fuzzy_gain(self, e_trk):
+        # 根據誤差值內插不同增益矩陣以調整響應特性
         abs_err = abs(float(e_trk[0]))
         w2 = float(np.clip(abs_err / POS_ERR_MAX, 0.0, 1.0))
         w1 = 1.0 - w2
@@ -234,6 +251,7 @@ class Fuzzy_ETM_Core:
         return F_fuzzy
 
     def apply_deadzone(self, e):
+        # 微小誤差不施加控制以消除穩態震盪
         e_out = e.copy()
         if abs(e_out[0]) < self.pos_deadzone:
             e_out[0] = 0.0
@@ -242,26 +260,33 @@ class Fuzzy_ETM_Core:
         return e_out
 
     def soft_scale(self, e):
+        # 對大誤差給予比例保護限制
         e_norm = float(np.linalg.norm(e))
         alpha = min(1.0, e_norm / self.soft_err) if self.soft_err > 1e-9 else 1.0
         alpha = max(alpha, ALPHA_MIN)
         return alpha
 
     def update(self, current_state, target_val, dt):
+        """
+        執行運算以生成 X 或 Y 軸的 pitch/roll 控制輸入。
+        根據目前狀態 (current_state) 和目標變量 (target_val)，判斷是否觸發(trigger)。
+        """
         dt = float(np.clip(dt, DT_MIN, DT_MAX))
         now = time.time()
 
+        # 生成本軸平滑參考線
         r_input = np.array([0.0, 4.0 * target_val], dtype=float)
         dx_r = self.Ar @ self.ref_state + r_input
         self.ref_state += dx_r * dt
 
-        e_trk = current_state - self.ref_state
-        e_net = self.last_sent_error - e_trk
+        e_trk = current_state - self.ref_state    # 軌跡誤差
+        e_net = self.last_sent_error - e_trk      # 網路延遲造成的傳輸與計算偏差
 
         term_net = float(e_net.T @ self.Omega @ e_net)
         term_trk = float(e_trk.T @ self.Omega @ e_trk)
 
         triggered = False
+        # 水平誤差觸發條件 (附加最短觸發間隔限制，避免過密網路負載)
         if self.first_run or (
             (term_net > SIGMA_POS * term_trk)
             and ((now - self.last_trigger_time) >= MIN_TRIGGER_INTERVAL)
@@ -271,14 +296,17 @@ class Fuzzy_ETM_Core:
             self.last_trigger_time = now
             self.last_sent_error = e_trk.copy()
 
+        # 使用低通濾波來過濾雜訊，避免干擾抖動
         self.filtered_error += (dt / TAU_FILTER_XY) * (
             self.last_sent_error - self.filtered_error
         )
         e_ctrl = self.apply_deadzone(self.filtered_error)
 
+        # 計算模糊控制增益與非線性軟限制
         F_fuzzy = self.get_fuzzy_gain(e_ctrl)
         alpha = self.soft_scale(e_ctrl)
 
+        # 控制輸入限幅與平滑防震率限制
         u_raw = float(alpha * (F_fuzzy @ e_ctrl) * self.gain_scale)
         du = (u_raw - self.prev_final_u) / dt
         if abs(du) > self.rate_limit:
@@ -297,7 +325,7 @@ class Fuzzy_ETM_Core:
 def clip_mission_target(x, y, z, home_x, home_y):
     max_xy = 30.0
     min_z = XY_ENABLE_ALTITUDE
-    max_z = min(TARGET_Z, ALT_SOFT_CEIL)
+    max_z = min(TARGET_Z + 5.0, ALT_HARD_CEIL)  # 放寬至最大容許值
 
     x = float(np.clip(x, home_x - max_xy, home_x + max_xy))
     y = float(np.clip(y, home_y - max_xy, home_y + max_xy))
@@ -390,12 +418,16 @@ def clear_mission():
 # 5. OpenAI 任務解析
 # ==========================================
 def parse_nl_command_with_openai(user_text, current_state, home_state):
+    """
+    透過 OpenAI API 將口語化的中文指令（如"升空"、"往南飛兩米"、"幫我跑個八字形"），
+    解析為系統可直接讀取的結構化 JSON 任務描述。
+    """
     schema = {
         "type": "object",
         "properties": {
             "command": {
                 "type": "string",
-                "enum": ["go_to", "hover", "relative_move", "inspect", "return_home", "reject"],
+                "enum": ["go_to", "hover", "relative_move", "inspect", "run_trajectory", "return_home", "reject"],
             },
             "frame": {
                 "type": "string",
@@ -423,6 +455,10 @@ def parse_nl_command_with_openai(user_text, current_state, home_state):
                 "required": ["x", "y", "z", "yaw"],
                 "additionalProperties": False,
             },
+            "traj_type": {
+                "type": "string",
+                "enum": ["fig8", "circle", ""]
+            },
             "hold_time": {"type": "number"},
             "policy": {
                 "type": "string",
@@ -438,10 +474,12 @@ def parse_nl_command_with_openai(user_text, current_state, home_state):
         "instruction": "將中文無人機任務轉成單一 JSON。不可輸出任何解釋文字。",
         "rules": [
             "不可輸出 roll pitch thrust pwm motor",
+            "若要求執行八字形或圓形飛行軌跡，使用 command=run_trajectory，且 traj_type=fig8 或 circle",
             "若語意不夠清楚或有風險，command=reject",
-            "前後左右上下等相對描述用 body frame",
+            "前後左右上下等相對描述用 body frame 且為 relative_move",
+            "往上飛 z 為正，往下飛 z 為負。例如往上飛三公尺 offset.z=3.0",
             "明確 x y z 座標用 local frame",
-            f"高度 z 必須在 {XY_ENABLE_ALTITUDE:.2f} 到 {min(TARGET_Z, ALT_SOFT_CEIL):.2f} 公尺之間",
+            f"絕對高度 z 必須考慮限制，最高不要超過 {ALT_HARD_CEIL:.2f} 公尺",
             "yaw 沒指定就給 0.0",
             "hold_time 沒指定就給 0.0",
             "若使用者提到節能、省電，policy=energy_saving",
@@ -481,8 +519,9 @@ def validate_parsed_command(cmd):
     offset = cmd.get("offset", {})
     hold_time = float(cmd.get("hold_time", 0.0))
     policy = cmd.get("policy", "normal")
+    traj_type = cmd.get("traj_type", "")
 
-    if command not in {"go_to", "hover", "relative_move", "inspect", "return_home", "reject"}:
+    if command not in {"go_to", "hover", "relative_move", "inspect", "run_trajectory", "return_home", "reject"}:
         return False, "unsupported command"
 
     if frame not in {"local", "body", "none"}:
@@ -496,15 +535,19 @@ def validate_parsed_command(cmd):
 
     if command in {"go_to", "inspect"}:
         z = float(target.get("z", 0.0))
-        if not (XY_ENABLE_ALTITUDE <= z <= min(TARGET_Z, ALT_SOFT_CEIL)):
+        if not (XY_ENABLE_ALTITUDE <= z <= ALT_HARD_CEIL):
             return False, "target z out of range"
 
     if command == "relative_move":
         dx = abs(float(offset.get("x", 0.0)))
         dy = abs(float(offset.get("y", 0.0)))
         dz = abs(float(offset.get("z", 0.0)))
-        if dx > 10.0 or dy > 10.0 or dz > 3.0:
+        if dx > 30.0 or dy > 30.0 or dz > 10.0:
             return False, "relative move too large"
+            
+    if command == "run_trajectory":
+        if traj_type not in {"fig8", "circle"}:
+            return False, "unsupported trajectory type"
 
     return True, ""
 
@@ -521,6 +564,7 @@ def apply_parsed_command(cmd, current_state, home_state):
     offset = cmd["offset"]
     hold_time = float(cmd["hold_time"])
     policy = cmd.get("policy", "normal")
+    traj_type = cmd.get("traj_type", "")
 
     x = current_state["x"]
     y = current_state["y"]
@@ -529,6 +573,17 @@ def apply_parsed_command(cmd, current_state, home_state):
 
     if command == "reject":
         print(f"[Mission] LLM rejected: {cmd.get('reason', '')}")
+        return
+
+    if command == "run_trajectory":
+        with MISSION_LOCK:
+            mission_state.mode = "traj"
+            mission_state.traj_type = traj_type
+            mission_state.traj_param = 10.0  # 預設參數
+            mission_state.policy = policy
+            mission_state.active = True
+            mission_state.hold_start_time = time.time()
+        print(f"[Mission] TRAJ {traj_type} from LLM | policy={policy}")
         return
 
     if command == "hover":
@@ -611,6 +666,7 @@ def command_thread_fn():
     print("  go x y z [policy]")
     print("  move dx dy dz [policy]")
     print("  inspect x y z hold [policy]")
+    print("  traj fig8/circle [param] [policy]")
     print("  rth [policy]")
     print("  nl 你的中文命令")
     print("  q\n")
@@ -693,6 +749,21 @@ def command_thread_fn():
                 print(f"[Mission] RTH activated | policy={policy}")
                 continue
 
+            if parts[0] == "traj" and len(parts) >= 2:
+                traj_type = parts[1]
+                param = float(parts[2]) if len(parts) >= 3 else 10.0
+                policy = normalize_policy(parts[3]) if len(parts) >= 4 else "normal"
+                
+                with MISSION_LOCK:
+                    mission_state.mode = "traj"
+                    mission_state.traj_type = traj_type
+                    mission_state.traj_param = param
+                    mission_state.policy = policy
+                    mission_state.active = True
+                    mission_state.hold_start_time = time.time()
+                print(f"[Mission] TRAJ {traj_type} param={param} | policy={policy}")
+                continue
+
             if parts[0] == "nl":
                 nl_text = cmdline[3:].strip()
                 if not nl_text:
@@ -713,6 +784,12 @@ def command_thread_fn():
 # 7. 軌跡狀態機（含任務覆蓋）
 # ==========================================
 def generate_trajectory(home_x, home_y, elapsed, current_x, current_y, current_z, current_yaw):
+    """
+    軌跡生成與任務狀態機：
+    根據目前的無人機狀態 (MissionState) 與任務類型(hold, goto, inspect, traj, rth等)，
+    決定下一瞬間無人機所應當抵達的目標位置 [tx, ty, tz] 或速度/加速度 [vx, vy, ax, ay] 。
+    其中 `traj` 模式支援了即時推算動態的「八字」與「圓形」飛行方程式。
+    """
     with MISSION_LOCK:
         ms = MissionState(**mission_state.__dict__)
 
@@ -765,6 +842,37 @@ def generate_trajectory(home_x, home_y, elapsed, current_x, current_y, current_z
                 set_hold_mission(tx, ty, tz, 0.0, 0.0, "rth_hold", policy=ms.policy)
                 return tx, ty, tz, 0.0, 0.0, 0.0, 0.0, "mission_rth_hold"
             return tx, ty, tz, 0.0, 0.0, 0.0, 0.0, "mission_rth"
+
+        elif ms.mode == "traj":
+            t_traj = time.time() - ms.hold_start_time
+            if ms.traj_type == "fig8":
+                A = ms.traj_param
+                B = A / 2.0
+                omega = 0.05
+                tx = home_x + A * math.sin(omega * t_traj)
+                ty = home_y + B * math.sin(2.0 * omega * t_traj)
+                tz = TARGET_Z
+                
+                vx = A * omega * math.cos(omega * t_traj)
+                vy = B * 2.0 * omega * math.cos(2.0 * omega * t_traj)
+                ax = -A * (omega**2) * math.sin(omega * t_traj)
+                ay = -B * ((2.0 * omega)**2) * math.sin(2.0 * omega * t_traj)
+                
+                return tx, ty, tz, vx, vy, ax, ay, "mission_traj_fig8"
+
+            elif ms.traj_type == "circle":
+                R = ms.traj_param
+                omega = 0.1
+                tx = home_x + R * math.cos(omega * t_traj)
+                ty = home_y + R * math.sin(omega * t_traj)
+                tz = TARGET_Z
+                
+                vx = -R * omega * math.sin(omega * t_traj)
+                vy = R * omega * math.cos(omega * t_traj)
+                ax = -R * (omega**2) * math.cos(omega * t_traj)
+                ay = -R * (omega**2) * math.sin(omega * t_traj)
+                
+                return tx, ty, tz, vx, vy, ax, ay, "mission_traj_circle"
 
     # 沒有任務時待命，不自動起飛
     return current_x, current_y, current_z, 0.0, 0.0, 0.0, 0.0, "idle"
