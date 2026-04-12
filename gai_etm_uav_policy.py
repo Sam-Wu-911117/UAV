@@ -466,7 +466,7 @@ def parse_nl_command_with_openai(user_text, current_state, home_state):
             },
             "reason": {"type": "string"},
         },
-        "required": ["command", "frame", "target", "offset", "hold_time", "policy", "reason"],
+        "required": ["command", "frame", "target", "offset", "traj_type", "hold_time", "policy", "reason"],
         "additionalProperties": False,
     }
 
