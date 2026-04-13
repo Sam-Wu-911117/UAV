@@ -130,6 +130,9 @@ class MissionState:
     target_z: float = TARGET_Z
     target_yaw: float = 0.0
 
+    path: list = field(default_factory=list)
+    path_index: int = 0
+
     hold_time: float = 0.0
     hold_start_time: float = 0.0
     
@@ -361,6 +364,27 @@ def set_hold_mission(x, y, z, yaw=0.0, hold_time=0.0, source_text="", policy="no
         mission_state.last_update_time = time.time()
 
 
+def set_path_mission(waypoints, source_text="", policy="normal"):
+    with MISSION_LOCK:
+        mission_state.mode = "follow_path"
+        mission_state.frame = "local"
+        mission_state.policy = normalize_policy(policy)
+        mission_state.path = waypoints
+        mission_state.path_index = 0
+        
+        if len(waypoints) > 0:
+            mission_state.target_x = waypoints[0]["x"]
+            mission_state.target_y = waypoints[0]["y"]
+            mission_state.target_z = waypoints[0]["z"]
+            mission_state.target_yaw = waypoints[0]["yaw"]
+            
+        mission_state.hold_time = 0.0
+        mission_state.hold_start_time = 0.0
+        mission_state.active = True
+        mission_state.source_text = source_text
+        mission_state.last_update_time = time.time()
+
+
 def set_goto_mission(x, y, z, yaw=0.0, source_text="", policy="normal"):
     with MISSION_LOCK:
         mission_state.mode = "goto"
@@ -411,6 +435,8 @@ def clear_mission():
         mission_state.active = False
         mission_state.hold_time = 0.0
         mission_state.hold_start_time = 0.0
+        mission_state.path = []
+        mission_state.path_index = 0
         mission_state.source_text = ""
         mission_state.last_update_time = time.time()
 
@@ -428,11 +454,25 @@ def parse_nl_command_with_openai(user_text, current_state, home_state, image_pat
         "properties": {
             "command": {
                 "type": "string",
-                "enum": ["go_to", "hover", "relative_move", "inspect", "run_trajectory", "return_home", "reject"],
+                "enum": ["go_to", "hover", "relative_move", "inspect", "run_trajectory", "return_home", "reject", "follow_path"],
             },
             "frame": {
                 "type": "string",
                 "enum": ["local", "body", "none"],
+            },
+            "path": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "number"},
+                        "y": {"type": "number"},
+                        "z": {"type": "number"},
+                        "yaw": {"type": "number"},
+                    },
+                    "required": ["x", "y", "z", "yaw"],
+                    "additionalProperties": False,
+                }
             },
             "target": {
                 "type": "object",
@@ -467,14 +507,15 @@ def parse_nl_command_with_openai(user_text, current_state, home_state, image_pat
             },
             "reason": {"type": "string"},
         },
-        "required": ["command", "frame", "target", "offset", "traj_type", "hold_time", "policy", "reason"],
+        "required": ["command", "frame", "target", "offset", "path", "traj_type", "hold_time", "policy", "reason"],
         "additionalProperties": False,
     }
 
     prompt = {
-        "instruction": "將中文無人機任務轉成單一 JSON。不可輸出任何解釋文字。",
+        "instruction": "將中文或附加的無人機任務轉成單一 JSON。若包含圖片則須以圖片判斷意圖。",
         "rules": [
             "不可輸出 roll pitch thrust pwm motor",
+            "若圖片中可辨識出一段飛行路徑、包含多個檢查點，令 command=follow_path 並將座標序列放入 path 陣列中 (須考慮從目前位置合理推進)",
             "若要求執行八字形或圓形飛行軌跡，使用 command=run_trajectory，且 traj_type=fig8 或 circle",
             "若語意不夠清楚或有風險，command=reject",
             "前後左右上下等相對描述用 body frame 且為 relative_move",
@@ -519,7 +560,7 @@ def parse_nl_command_with_openai(user_text, current_state, home_state, image_pat
         # 兼容 responses API 或標準 chat API
         if hasattr(client, "responses"):
             response = client.responses.create(
-                model="gpt-5.1" if not image_path else "gpt-4o",  # 依照原本寫法，有圖片使用 4o
+                model="gpt-5.4" if image_path else "gpt-4o",  # 有圖片用 5.4，沒圖片用 4o
                 input=messages,
                 text={
                     "format": {
@@ -533,7 +574,7 @@ def parse_nl_command_with_openai(user_text, current_state, home_state, image_pat
             return json.loads(response.output_text)
         else:
             response = client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.4" if image_path else "gpt-4o",
                 messages=messages,
                 response_format={"type": "json_object"}
             )
@@ -548,11 +589,12 @@ def validate_parsed_command(cmd):
     frame = cmd.get("frame", "none")
     target = cmd.get("target", {})
     offset = cmd.get("offset", {})
+    path = cmd.get("path", [])
     hold_time = float(cmd.get("hold_time", 0.0))
     policy = cmd.get("policy", "normal")
     traj_type = cmd.get("traj_type", "")
 
-    if command not in {"go_to", "hover", "relative_move", "inspect", "run_trajectory", "return_home", "reject"}:
+    if command not in {"go_to", "hover", "relative_move", "inspect", "run_trajectory", "return_home", "reject", "follow_path"}:
         return False, "unsupported command"
 
     if frame not in {"local", "body", "none"}:
@@ -568,6 +610,14 @@ def validate_parsed_command(cmd):
         z = float(target.get("z", 0.0))
         if not (XY_ENABLE_ALTITUDE <= z <= ALT_HARD_CEIL):
             return False, "target z out of range"
+
+    if command == "follow_path":
+        if not path or len(path) == 0:
+            return False, "missing path waypoints"
+        for wp in path:
+            z = float(wp.get("z", TARGET_Z))
+            if not (XY_ENABLE_ALTITUDE <= z <= ALT_HARD_CEIL):
+                return False, "a waypoint z is out of range"
 
     if command == "relative_move":
         dx = abs(float(offset.get("x", 0.0)))
@@ -593,6 +643,7 @@ def apply_parsed_command(cmd, current_state, home_state):
     frame = cmd["frame"]
     target = cmd["target"]
     offset = cmd["offset"]
+    path_data = cmd.get("path", [])
     hold_time = float(cmd["hold_time"])
     policy = cmd.get("policy", "normal")
     traj_type = cmd.get("traj_type", "")
@@ -645,6 +696,21 @@ def apply_parsed_command(cmd, current_state, home_state):
         tx, ty, tz = clip_mission_target(tx, ty, tz, home_state["x"], home_state["y"])
         set_goto_mission(tx, ty, tz, float(target["yaw"]), source_text="go_to", policy=policy)
         print(f"[Mission] GOTO ({tx:.2f}, {ty:.2f}, {tz:.2f}) | policy={policy}")
+        return
+
+    if command == "follow_path":
+        pts = []
+        for wp in path_data:
+            wx, wy, wz = clip_mission_target(
+                float(wp.get("x", 0)), float(wp.get("y", 0)), float(wp.get("z", TARGET_Z)),
+                home_state["x"], home_state["y"]
+            )
+            pts.append({
+                "x": wx, "y": wy, "z": wz, "yaw": float(wp.get("yaw", 0.0))
+            })
+        set_path_mission(pts, source_text="follow_path", policy=policy)
+        if pts:
+            print(f"[Mission] FOLLOW_PATH with {len(pts)} points, moving to first: ({pts[0]['x']:.2f}, {pts[0]['y']:.2f}) | policy={policy}")
         return
 
     if command == "relative_move":
@@ -817,7 +883,7 @@ def command_thread_fn():
                 try:
                     with open(audio_path, "rb") as audio_file:
                         transcript = client.audio.transcriptions.create(
-                            model="whisper-1", 
+                            model="gpt-5.4", 
                             file=audio_file
                         )
                     text = transcript.text
@@ -845,7 +911,7 @@ def command_thread_fn():
                     
                     with open(wav_path, "rb") as audio_file:
                         transcript = client.audio.transcriptions.create(
-                            model="whisper-1", 
+                            model="gpt-5.4", 
                             file=audio_file
                         )
                     text = transcript.text
@@ -913,6 +979,30 @@ def generate_trajectory(home_x, home_y, elapsed, current_x, current_y, current_z
                 clear_mission()
                 return current_x, current_y, current_z, 0.0, 0.0, 0.0, 0.0, "idle"
             return ms.target_x, ms.target_y, ms.target_z, 0.0, 0.0, 0.0, 0.0, "mission_goto"
+
+        elif ms.mode == "follow_path":
+            dist = math.sqrt(
+                (current_x - ms.target_x) ** 2
+                + (current_y - ms.target_y) ** 2
+                + (current_z - ms.target_z) ** 2
+            )
+            if dist < reach_tol:
+                # 抵達當前航點，切換至下一個
+                with MISSION_LOCK:
+                    ms.path_index += 1
+                    if ms.path_index < len(ms.path):
+                        mission_state.path_index = ms.path_index
+                        mission_state.target_x = ms.path[ms.path_index]["x"]
+                        mission_state.target_y = ms.path[ms.path_index]["y"]
+                        mission_state.target_z = ms.path[ms.path_index]["z"]
+                        mission_state.target_yaw = ms.path[ms.path_index]["yaw"]
+                        print(f"[Mission] WP Reached. Next: ({mission_state.target_x:.2f}, {mission_state.target_y:.2f})")
+                        return mission_state.target_x, mission_state.target_y, mission_state.target_z, 0.0, 0.0, 0.0, 0.0, "mission_path"
+                    else:
+                        print("[Mission] Path Finished.")
+                        clear_mission()
+                        return current_x, current_y, current_z, 0.0, 0.0, 0.0, 0.0, "idle"
+            return ms.target_x, ms.target_y, ms.target_z, 0.0, 0.0, 0.0, 0.0, "mission_path"
 
         elif ms.mode == "inspect":
             dist = math.sqrt(
