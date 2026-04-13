@@ -417,10 +417,11 @@ def clear_mission():
 # ==========================================
 # 5. OpenAI 任務解析
 # ==========================================
-def parse_nl_command_with_openai(user_text, current_state, home_state):
+def parse_nl_command_with_openai(user_text, current_state, home_state, image_path=None):
     """
     透過 OpenAI API 將口語化的中文指令（如"升空"、"往南飛兩米"、"幫我跑個八字形"），
     解析為系統可直接讀取的結構化 JSON 任務描述。
+    若提供 image_path，則結合多模態分析結果。
     """
     schema = {
         "type": "object",
@@ -493,24 +494,54 @@ def parse_nl_command_with_openai(user_text, current_state, home_state):
         "user_text": user_text,
     }
 
-    response = client.responses.create(
-        model="gpt-5.1",
-        input=[
-            {"role": "system", "content": "你是無人機任務命令解析器，只能輸出符合 schema 的 JSON。"},
-            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-        ],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "uav_command",
-                "schema": schema,
-                "strict": True,
-            }
-        },
-    )
+    messages = [{"role": "system", "content": "你是無人機任務命令解析器，只能輸出符合 schema 的 JSON。"}]
+    
+    if image_path:
+        import base64
+        try:
+            with open(image_path, "rb") as f:
+                base64_img = base64.b64encode(f.read()).decode("utf-8")
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "加上參考這張圖片。 " + json.dumps(prompt, ensure_ascii=False)},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
+                ]
+            })
+        except Exception as e:
+            print(f"[OpenAI Error] 無法讀取圖片 {e}")
+            messages.append({"role": "user", "content": json.dumps(prompt, ensure_ascii=False)})
+    else:
+        messages.append({"role": "user", "content": json.dumps(prompt, ensure_ascii=False)})
 
-    return json.loads(response.output_text)
-
+    import traceback
+    try:
+        # 兼容 responses API 或標準 chat API
+        if hasattr(client, "responses"):
+            response = client.responses.create(
+                model="gpt-5.1" if not image_path else "gpt-4o",  # 依照原本寫法，有圖片使用 4o
+                input=messages,
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "uav_command",
+                        "schema": schema,
+                        "strict": True,
+                    }
+                },
+            )
+            return json.loads(response.output_text)
+        else:
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=messages,
+                response_format={"type": "json_object"}
+            )
+            return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        print(f"OpenAI parsing failed: {e}")
+        traceback.print_exc()
+        return {}
 
 def validate_parsed_command(cmd):
     command = cmd.get("command", "")
@@ -669,6 +700,9 @@ def command_thread_fn():
     print("  traj fig8/circle [param] [policy]")
     print("  rth [policy]")
     print("  nl 你的中文命令")
+    print("  voice <audio_file_path>")
+    print("  mic [錄音秒數=5]")
+    print("  img <image_file_path> [你的中文命令]")
     print("  q\n")
 
     while True:
@@ -773,6 +807,71 @@ def command_thread_fn():
                 parsed = parse_nl_command_with_openai(nl_text, curr, home)
                 print("[Mission][LLM JSON]", json.dumps(parsed, ensure_ascii=False))
                 apply_parsed_command(parsed, curr, home)
+                continue
+
+            if parts[0] == "voice":
+                if len(parts) < 2:
+                    print("[Mission] missing audio file path")
+                    continue
+                audio_path = parts[1]
+                try:
+                    with open(audio_path, "rb") as audio_file:
+                        transcript = client.audio.transcriptions.create(
+                            model="whisper-1", 
+                            file=audio_file
+                        )
+                    text = transcript.text
+                    print(f"[Voice] 語音辨識結果: {text}")
+                    parsed = parse_nl_command_with_openai(text, curr, home)
+                    print("[Mission][LLM JSON]", json.dumps(parsed, ensure_ascii=False))
+                    apply_parsed_command(parsed, curr, home)
+                except Exception as e:
+                    print(f"[Mission] Voice error: {e}")
+                continue
+
+            if parts[0] == "mic":
+                dur = float(parts[1]) if len(parts) >= 2 else 5.0
+                print(f"[Mic] 準備錄音，請說話 ({dur} 秒)...")
+                try:
+                    import sounddevice as sd
+                    import scipy.io.wavfile as wavfile
+                    
+                    fs = 44100
+                    recording = sd.rec(int(dur * fs), samplerate=fs, channels=1, dtype='int16')
+                    sd.wait()
+                    wav_path = "temp_mic_record.wav"
+                    wavfile.write(wav_path, fs, recording)
+                    print("[Mic] 錄音結束，正在辨識...")
+                    
+                    with open(wav_path, "rb") as audio_file:
+                        transcript = client.audio.transcriptions.create(
+                            model="whisper-1", 
+                            file=audio_file
+                        )
+                    text = transcript.text
+                    print(f"[Mic] 語音辨識結果: {text}")
+                    
+                    parsed = parse_nl_command_with_openai(text, curr, home)
+                    print("[Mission][LLM JSON]", json.dumps(parsed, ensure_ascii=False))
+                    apply_parsed_command(parsed, curr, home)
+                except ImportError:
+                    print("[Mic] 缺少錄音相關套件，請在終端機安裝: pip install sounddevice scipy")
+                except Exception as e:
+                    print(f"[Mission] Mic error: {e}")
+                continue
+
+            if parts[0] == "img":
+                if len(parts) < 2:
+                    print("[Mission] missing image file path")
+                    continue
+                img_path = parts[1]
+                nl_text = " ".join(parts[2:]) if len(parts) > 2 else "請根據圖片指派任務"
+                try:
+                    parsed = parse_nl_command_with_openai(nl_text, curr, home, image_path=img_path)
+                    print("[Mission][LLM JSON]", json.dumps(parsed, ensure_ascii=False))
+                    apply_parsed_command(parsed, curr, home)
+                except Exception as e:
+                    print(f"[Mission] Image error: {e}")
                 continue
 
             print("[Mission] unsupported command")
