@@ -620,12 +620,18 @@ def validate_parsed_command(cmd):
                 return False, "a waypoint z is out of range"
 
     if command == "relative_move":
-        dx = abs(float(offset.get("x", 0.0)))
-        dy = abs(float(offset.get("y", 0.0)))
-        dz = abs(float(offset.get("z", 0.0)))
-        if dx > 30.0 or dy > 30.0 or dz > 10.0:
-            return False, "relative move too large"
-            
+        dx_body = float(offset["x"])
+        dy_body = float(offset["y"])
+        dz = float(offset["z"])
+        dx, dy = body_to_world(dx_body, dy_body, yaw)
+        tx = x + dx
+        ty = y + dy
+        tz = z + dz
+        tx, ty, tz = clip_mission_target(tx, ty, tz, home_state["x"], home_state["y"])
+        set_goto_mission(tx, ty, tz, yaw + float(offset["yaw"]), source_text="relative_move", policy=policy)
+        print(f"[Mission] REL_MOVE -> ({tx:.2f}, {ty:.2f}, {tz:.2f}) | policy={policy}")
+        return
+
     if command == "run_trajectory":
         if traj_type not in {"fig8", "circle"}:
             return False, "unsupported trajectory type"
@@ -883,7 +889,7 @@ def command_thread_fn():
                 try:
                     with open(audio_path, "rb") as audio_file:
                         transcript = client.audio.transcriptions.create(
-                            model="gpt-5.4", 
+                            model="whisper-1", 
                             file=audio_file
                         )
                     text = transcript.text
@@ -911,7 +917,7 @@ def command_thread_fn():
                     
                     with open(wav_path, "rb") as audio_file:
                         transcript = client.audio.transcriptions.create(
-                            model="gpt-5.4", 
+                            model="whisper-1", 
                             file=audio_file
                         )
                     text = transcript.text
