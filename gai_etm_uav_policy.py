@@ -557,28 +557,12 @@ def parse_nl_command_with_openai(user_text, current_state, home_state, image_pat
 
     import traceback
     try:
-        # 兼容 responses API 或標準 chat API
-        if hasattr(client, "responses"):
-            response = client.responses.create(
-                model="gpt-5.4" if image_path else "gpt-4o",  # 有圖片用 5.4，沒圖片用 4o
-                input=messages,
-                text={
-                    "format": {
-                        "type": "json_schema",
-                        "name": "uav_command",
-                        "schema": schema,
-                        "strict": True,
-                    }
-                },
-            )
-            return json.loads(response.output_text)
-        else:
-            response = client.chat.completions.create(
-                model="gpt-5.4" if image_path else "gpt-4o",
-                messages=messages,
-                response_format={"type": "json_object"}
-            )
-            return json.loads(response.choices[0].message.content)
+        response = client.chat.completions.create(
+            model="gpt-5.4" if image_path else "gpt-4o",
+            messages=messages,
+            response_format={"type": "json_object"}
+        )
+        return json.loads(response.choices[0].message.content)
     except Exception as e:
         print(f"OpenAI parsing failed: {e}")
         traceback.print_exc()
