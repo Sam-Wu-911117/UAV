@@ -1,0 +1,1 @@
+﻿t,pi_ts,clock_diff_ms,mode,x,y,z,vx,vy,vz,yaw,target_x,target_y,target_z,target_vx,target_vy,err_w_x,err_w_y,err_w_vx,err_w_vy,err_b_x,err_b_y,err_b_vx,err_b_vy,u_roll,u_pitch,u_accel,target_roll,target_pitch,yaw_rate_cmd,thrust_cmd,trig_x,trig_y,trig_z,is_triggered
