@@ -604,17 +604,8 @@ def validate_parsed_command(cmd):
                 return False, "a waypoint z is out of range"
 
     if command == "relative_move":
-        dx_body = float(offset["x"])
-        dy_body = float(offset["y"])
-        dz = float(offset["z"])
-        dx, dy = body_to_world(dx_body, dy_body, yaw)
-        tx = x + dx
-        ty = y + dy
-        tz = z + dz
-        tx, ty, tz = clip_mission_target(tx, ty, tz, home_state["x"], home_state["y"])
-        set_goto_mission(tx, ty, tz, yaw + float(offset["yaw"]), source_text="relative_move", policy=policy)
-        print(f"[Mission] REL_MOVE -> ({tx:.2f}, {ty:.2f}, {tz:.2f}) | policy={policy}")
-        return
+        # Additional validation can be done here if needed
+        pass
 
     if command == "run_trajectory":
         if traj_type not in {"fig8", "circle"}:
