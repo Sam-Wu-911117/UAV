@@ -620,12 +620,12 @@ def apply_parsed_command(cmd, current_state, home_state):
         print(f"[Mission] Reject by validator: {reason}")
         return
 
-    command = cmd["command"]
-    frame = cmd["frame"]
-    target = cmd["target"]
-    offset = cmd["offset"]
+    command = cmd.get("command", "")
+    frame = cmd.get("frame", "none")
+    target = cmd.get("target", {})
+    offset = cmd.get("offset", {})
     path_data = cmd.get("path", [])
-    hold_time = float(cmd["hold_time"])
+    hold_time = float(cmd.get("hold_time", 0.0))
     policy = cmd.get("policy", "normal")
     traj_type = cmd.get("traj_type", "")
 
@@ -675,7 +675,7 @@ def apply_parsed_command(cmd, current_state, home_state):
             tz = float(target["z"])
 
         tx, ty, tz = clip_mission_target(tx, ty, tz, home_state["x"], home_state["y"])
-        set_goto_mission(tx, ty, tz, float(target["yaw"]), source_text="go_to", policy=policy)
+        set_goto_mission(tx, ty, tz, float(target.get("yaw", 0.0)), source_text="go_to", policy=policy)
         print(f"[Mission] GOTO ({tx:.2f}, {ty:.2f}, {tz:.2f}) | policy={policy}")
         return
 
@@ -695,15 +695,15 @@ def apply_parsed_command(cmd, current_state, home_state):
         return
 
     if command == "relative_move":
-        dx_body = float(offset["x"])
-        dy_body = float(offset["y"])
-        dz = float(offset["z"])
+        dx_body = float(offset.get("x", 0.0))
+        dy_body = float(offset.get("y", 0.0))
+        dz = float(offset.get("z", 0.0))
         dx, dy = body_to_world(dx_body, dy_body, yaw)
         tx = x + dx
         ty = y + dy
         tz = z + dz
         tx, ty, tz = clip_mission_target(tx, ty, tz, home_state["x"], home_state["y"])
-        set_goto_mission(tx, ty, tz, yaw + float(offset["yaw"]), source_text="relative_move", policy=policy)
+        set_goto_mission(tx, ty, tz, yaw + float(offset.get("yaw", 0.0)), source_text="relative_move", policy=policy)
         print(f"[Mission] REL_MOVE -> ({tx:.2f}, {ty:.2f}, {tz:.2f}) | policy={policy}")
         return
 
