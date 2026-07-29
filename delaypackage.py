@@ -28,7 +28,8 @@ from tf_transformations import euler_from_quaternion, quaternion_from_euler
 # =========================
 # UDP 設定
 # =========================
-WINDOWS_IP = "10.203.103.16"
+WINDOWS_IP = "127.0.0.1"
+#localhost 127.0.0.1
 UDP_SEND_PORT = 5006   # Ubuntu -> Windows (state)
 UDP_RECV_PORT = 5005   # Windows -> Ubuntu (cmd)
 
