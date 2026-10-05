@@ -95,7 +95,11 @@ class PX4DDS_UDP_Offboard_Attitude(Node):
         self.last_cmd_time = 0.0
         self.have_cmd = False
         self.echo_time = 0.0  # [新增] 用來儲存 Windows 傳過來的時間戳記
-
+        
+        # [新增] 風扇控制變數
+        self.cmd_fan = 1          # 預設為 1 (保持開啟)
+        self.last_fan_state = -1  # 紀錄上次狀態以避免重複發送 ROS 2 訊息
+        
         # ---------- Offboard ----------
         self.start_time = time.time()
         self.sent_offboard_cmd = False
@@ -231,6 +235,9 @@ class PX4DDS_UDP_Offboard_Attitude(Node):
                 elif len(data) == 24:
                     # [修改] 將收到的 Windows 時間戳記存入 self.echo_time
                     r, p, y, t, self.echo_time = struct.unpack("<4f d", data)
+                # [新增] 解析包含風扇旗標的 28 bytes 封包
+                elif len(data) == 28:
+                    r, p, y, t, self.echo_time, self.cmd_fan = struct.unpack("<4f d i", data)
                 else:
                     continue
 
@@ -271,6 +278,17 @@ class PX4DDS_UDP_Offboard_Attitude(Node):
             thrust = FAILSAFE_THRUST
 
         self.publish_attitude_setpoint(roll, pitch, yaw, thrust)
+        
+        # [新增] 只有當風扇狀態改變時，才發布 Actuator 指令給 Pixhawk AUX
+        if self.have_cmd and (self.cmd_fan != self.last_fan_state):
+            # 參數1 為 1.0 代表開啟 AUX 繼電器，0.0 為關閉
+            self.send_vehicle_command(
+                command=VehicleCommand.VEHICLE_CMD_DO_SET_ACTUATOR, 
+                param1=float(self.cmd_fan)
+            )
+            self.last_fan_state = self.cmd_fan
+            state_str = "保持開啟 💨" if self.cmd_fan == 1 else "關閉 🛑"
+            self.get_logger().info(f"🔄 接收到地面站指令，風扇狀態切換為: {state_str}")
 
         if (now - self._last_dbg) >= DBG_PERIOD_S:
             self._last_dbg = now
