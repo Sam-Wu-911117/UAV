@@ -361,7 +361,7 @@ def main():
                     last_send_time = curr_time
 
                 # 紀錄資料供繪圖
-                log_data.append([elapsed, x, y, z, tgt_x, tgt_y, tgt_z, is_triggered])
+                log_data.append([elapsed, x, y, z, tgt_x, tgt_y, tgt_z, is_triggered, fan_cmd])
 
                 # 終端機狀態輸出
                 if curr_time - last_print_time >= 0.2:
