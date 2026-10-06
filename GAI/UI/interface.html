@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <!-- 引入 EventEmitter2 (roslib 依賴) 與 roslibjs -->
+    <script src="https://cdn.jsdelivr.net/npm/eventemitter2/lib/eventemitter2.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/roslib/build/roslib.min.js"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>農電巡檢管家</title>
+    <style>
+        :root {
+            --primary-color: #2e7d32;
+            --bg-color: #f5f7fa;
+            --card-bg: #ffffff;
+            --text-main: #333333;
+            --text-muted: #666666;
+            --border-radius: 12px;
+        }
+
+        * {
+            box-sizing: border-box;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 800px;
+            background: var(--card-bg);
+            border-radius: var(--border-radius);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.05);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            height: 95vh;
+        }
+
+        /* 標題狀態列 */
+        .header {
+            background-color: var(--primary-color);
+            color: white;
+            padding: 15px 20px;
+            font-size: 1.2rem;
+            font-weight: bold;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .status-badge {
+            background: rgba(255,255,255,0.2);
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 1rem;
+        }
+
+        /* 狀態監控儀表板 */
+        .dashboard {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+            padding: 20px;
+            background: #fafafa;
+            border-bottom: 1px solid #eee;
+        }
+
+        .stat-card {
+            background: #fff;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #e0e0e0;
+        }
+
+        .stat-title {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+        }
+
+        .progress-bar-bg {
+            background: #e0e0e0;
+            height: 12px;
+            border-radius: 6px;
+            overflow: hidden;
+            margin-bottom: 5px;
+        }
+
+        .progress-bar-fill {
+            height: 100%;
+            background: var(--primary-color);
+            transition: width 0.3s ease;
+        }
+
+        .stat-value {
+            font-size: 0.85rem;
+            font-weight: bold;
+        }
+
+        /* 即時回報區塊 */
+        .feed-section {
+            flex-grow: 1;
+            padding: 20px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .feed-title {
+            font-size: 1.1rem;
+            font-weight: bold;
+            margin-bottom: 10px;
+            color: var(--primary-color);
+        }
+
+        .feed-item {
+            background: #f1f8e9;
+            border-left: 4px solid var(--primary-color);
+            padding: 12px 15px;
+            border-radius: 4px;
+            font-size: 0.95rem;
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* 指令輸入區塊 */
+        .command-section {
+            padding: 20px;
+            background: #fff;
+            border-top: 1px solid #eee;
+        }
+
+        .input-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .input-group input {
+            flex-grow: 1;
+            padding: 12px 15px;
+            border: 1px solid #ccc;
+            border-radius: 25px;
+            font-size: 1rem;
+            outline: none;
+        }
+
+        .input-group input:focus {
+            border-color: var(--primary-color);
+        }
+
+        .input-group button {
+            background: var(--primary-color);
+            color: white;
+            border: none;
+            padding: 0 25px;
+            border-radius: 25px;
+            font-size: 1rem;
+            cursor: pointer;
+            font-weight: bold;
+        }
+
+        .quick-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .quick-actions button {
+            background: #e8f5e9;
+            color: var(--primary-color);
+            border: 1px solid #c8e6c9;
+            padding: 8px 15px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .quick-actions button:hover {
+            background: #c8e6c9;
+        }
+
+        .quick-actions button.danger {
+            background: #ffebee;
+            color: #c62828;
+            border-color: #ffcdd2;
+        }
+
+        .quick-actions button.danger:hover {
+            background: #ffcdd2;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <!-- 標題狀態列 -->
+    <div class="header">
+        <span>🚁 農電巡檢管家</span>
+        <span class="status-badge">🟢 執行任務中</span>
+    </div>
+
+    <!-- 狀態監控儀表板 -->
+    <div class="dashboard">
+        <!-- 將這段 HTML 替換原本的電量卡片 -->
+        <div class="stat-card">
+            <div class="stat-title">🔋 無人機電量</div>
+            <div class="progress-bar-bg">
+                <!-- 加入 id="battery-bar" -->
+                <div id="battery-bar" class="progress-bar-fill" style="width: 100%;"></div>
+            </div>
+            <!-- 加入 id="battery-value" -->
+            <div id="battery-value" class="stat-value">等待連線...</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-title">💧 藥箱剩餘量</div>
+            <div class="progress-bar-bg">
+                <div class="progress-bar-fill" style="width: 80%; background: #0277bd;"></div>
+            </div>
+            <div class="stat-value">80%</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-title">🚗 充電車待命狀態</div>
+            <div class="progress-bar-bg">
+                <div class="progress-bar-fill" style="width: 100%; background: #4caf50;"></div>
+            </div>
+            <div class="stat-value">100% (位置：基地 A)</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-title">📊 任務總進度</div>
+            <div class="progress-bar-bg">
+                <div class="progress-bar-fill" style="width: 45%; background: #ff9800;"></div>
+            </div>
+            <div class="stat-value">45% (已檢查 120 塊面板)</div>
+        </div>
+    </div>
+
+    <!-- 即時回報區塊 -->
+    <div class="feed-section" id="feed-container">
+        <div class="feed-title">📍 即時回報畫面</div>
+        <div class="feed-item">
+            📷 [畫面] 發現 1 處熱斑，已自動標記在地圖上。(14:05)
+        </div>
+        <div class="feed-item" style="border-color: #0277bd; background: #e1f5fe;">
+            💦 [畫面] 發現 C 區下方有雜草，已進行精準投藥。(14:12)
+        </div>
+    </div>
+
+    <!-- 指令輸入區塊 -->
+    <div class="command-section">
+        <div class="input-group">
+            <input type="text" id="command-input" placeholder="按住 🎤 說話，或輸入指令，例如：去 C 區巡視...">
+            <button onclick="sendCommand()">送出</button>
+        </div>
+        <div class="quick-actions">
+            <button onclick="sendQuickCommand('▶️ 開始全面巡檢')">▶️ 開始全面巡檢</button>
+            <button onclick="sendQuickCommand('💦 僅執行植物投藥')">💦 僅執行植物投藥</button>
+            <button onclick="sendQuickCommand('🔋 呼叫充電車對接')">🔋 呼叫充電車對接</button>
+            <button class="danger" onclick="sendQuickCommand('🛑 緊急煞停並原地降落')">🛑 緊急煞停並原地降落</button>
+        </div>
+    </div>
+</div>
+
+<script>
+    // ==========================================
+    // ROS 2 WebSocket 連線設定
+    // ==========================================
+    // 建立 ROS 連線物件 (請將 localhost 替換為執行 rosbridge_server 的機器 IP)
+    const ros = new ROSLIB.Ros({
+        url : 'ws://localhost:9090'
+    });
+
+    // 連線狀態事件監聽 (可將狀態更新至 UI 日誌)
+    ros.on('connection', function() {
+        addFeedItem('🌐 已成功連線至 ROS 2 控制系統', '#4caf50', '#e8f5e9');
+    });
+
+    ros.on('error', function(error) {
+        addFeedItem('❌ ROS 2 連線發生錯誤', '#c62828', '#ffebee');
+    });
+
+    ros.on('close', function() {
+        addFeedItem('⚠️️ ROS 2 連線已中斷', '#ff9800', '#fff3e0');
+    });
+
+    // ==========================================
+    // 訂閱主題 (Topics) 與更新 UI
+    // ==========================================
+
+    // 1. 訂閱無人機電量 (假設使用標準 sensor_msgs/BatteryState)
+    const batteryListener = new ROSLIB.Topic({
+        ros : ros,
+        name : '/drone/battery_state',
+        messageType : 'sensor_msgs/msg/BatteryState'
+    });
+
+batteryListener.subscribe(function(message) {
+    // 假設 message.percentage 為 0.0 ~ 1.0 的浮點數
+    const batteryPercent = Math.round(message.percentage * 100);
+    
+    // 更新 DOM 元素 (需在 HTML 中為電量文字與進度條加上對應 id)
+    document.getElementById('battery-value').innerText = `${batteryPercent}%`;
+    document.getElementById('battery-bar').style.width = `${batteryPercent}%`;
+    
+    // 低電量 UI 警告邏輯
+    if (batteryPercent < 20) {
+        document.getElementById('battery-bar').style.background = '#c62828';
+    } else {
+        document.getElementById('battery-bar').style.background = '#2e7d32'; // 恢復正常顏色
+    }
+});
+
+// 2. 訂閱任務進度 (假設使用自訂義或標準 std_msgs/Float32)
+const progressListener = new ROSLIB.Topic({
+    ros : ros,
+    name : '/drone/task_completion',
+    messageType : 'std_msgs/msg/Float32'
+});
+
+progressListener.subscribe(function(message) {
+    // message.data 即為 VLA 結合里程計計算出的 C 值 (例如 45.0)
+    const progressPercent = Math.round(message.data);
+    
+    document.getElementById('progress-value').innerText = `${progressPercent}%`;
+    document.getElementById('progress-bar').style.width = `${progressPercent}%`;
+});
+    // 取得回報區塊元素
+    const feedContainer = document.getElementById('feed-container');
+    const commandInput = document.getElementById('command-input');
+
+    // ==========================================
+// 建立 VLA 推理的 ROS 2 Service Client
+// ==========================================
+const vlaCommandService = new ROSLIB.Service({
+    ros: ros,                           // 綁定前面建立的 ros 連線物件
+    name: '/vla/process_command',       // 對應 Jetson Orin NX 上的 Service 名稱
+    serviceType: 'vla_interfaces/srv/ProcessCommand' // 對應的 Service 封包型態
+});
+
+// ==========================================
+// 攔截輸入框內容並發送 Service Call
+// ==========================================
+function sendCommand() {
+    const text = commandInput.value.trim();
+    if (text === '') return; // 防呆：若無內容則不處理
+
+    // 1. 立即在畫面上顯示使用者輸入，提供視覺回饋
+    addFeedItem(`🗣️ 收到指令：「${text}」，VLA 解析中...`, '#ff9800', '#fff3e0');
+    commandInput.value = ''; // 清空輸入框
+
+    // 2. 封裝 Service Request 請求封包
+    const request = new ROSLIB.ServiceRequest({
+        prompt: text // 將自然語言字串放入名為 prompt 的欄位中
+    });
+
+    // 3. 呼叫 Service，透過 WebSocket 傳送至 ROS 2
+    vlaCommandService.callService(
+        request, 
+        // 成功接收到 VLA 回覆時的回呼函式 (Callback)
+        function(result) {
+            if (result.success) {
+                // VLA 成功解析並決定動作
+                addFeedItem(`✅ VLA 決策完成：${result.action_message}`, '#4caf50', '#e8f5e9');
+            } else {
+                // VLA 拒絕或無法解析該指令
+                addFeedItem(`⚠️ VLA 無法解析：${result.action_message}`, '#f44336', '#ffebee');
+            }
+        }, 
+        // 通訊失敗或節點未啟動時的錯誤處理 (Error Callback)
+        function(error) {
+            addFeedItem(`❌ 傳送至 VLA 失敗：機載電腦網路異常或服務未啟動`, '#c62828', '#ffebee');
+            console.error('Service call error: ', error);
+        }
+    );
+}
+
+    // 處理快捷按鈕指令
+    function sendQuickCommand(action) {
+        let color = '#2e7d32';
+        let bgColor = '#e8f5e9';
+        
+        if(action.includes('緊急')) {
+            color = '#c62828';
+            bgColor = '#ffebee';
+        } else if (action.includes('充電')) {
+            color = '#ff9800';
+            bgColor = '#fff3e0';
+        }
+
+        addFeedItem(`⚡ 啟動快捷模式：${action}`, color, bgColor);
+    }
+
+    // 將新訊息加入畫面中並滾動到底部
+    function addFeedItem(text, borderColor, bgColor) {
+        const timeString = new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' });
+        const newItem = document.createElement('div');
+        newItem.className = 'feed-item';
+        newItem.style.borderLeftColor = borderColor;
+        newItem.style.backgroundColor = bgColor;
+        newItem.innerText = `${text} (${timeString})`;
+        
+        feedContainer.appendChild(newItem);
+        feedContainer.scrollTop = feedContainer.scrollHeight;
+    }
+
+    // 監聽 Enter 鍵發送
+    commandInput.addEventListener('keypress', function (e) {
+        if (e.key === 'Enter') {
+            sendCommand();
+        }
+    });
+</script>
+
+</body>
+</html>
