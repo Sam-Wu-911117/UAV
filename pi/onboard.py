@@ -13,7 +13,18 @@ import struct
 import time
 import math
 import random
+import threading
 from collections import deque
+
+# =========================
+# [新增] 機載 GAI 與 Web 依賴庫
+# =========================
+from fastapi import FastAPI
+from pydantic import BaseModel
+import uvicorn
+import torch
+# 若出現錯誤，請確認已在 WSL 執行: pip install -e ".[smolvla]"
+from lerobot.common.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
 from px4_msgs.msg import (
     VehicleLocalPosition,
@@ -30,44 +41,100 @@ from sensor_msgs.msg import BatteryState
 # UDP 設定
 # =========================
 WINDOWS_IP = "127.0.0.1"
-#localhost 127.0.0.1
 UDP_SEND_PORT = 5006   # Ubuntu -> Windows (state)
 UDP_RECV_PORT = 5005   # Windows -> Ubuntu (cmd)
 
-# =========================
-# 網路模擬設定 (Network Simulation)
-# =========================
-SIM_PACKET_LOSS_RATE = 0.00  # 掉包率 (0.3 代表 30%)
-SIM_NETWORK_DELAY = 0.00    # 延遲時間 (秒)
-
-# =========================
-# Offboard 參數
-# =========================
+SIM_PACKET_LOSS_RATE = 0.00  
+SIM_NETWORK_DELAY = 0.00    
 SETPOINT_RATE_HZ = 50.0
 CMD_RATE_HZ = 100.0
-
 PRESETPOINT_SECONDS = 1.0
 HEARTBEAT_TIMEOUT_S = 0.5
-
 FAILSAFE_THRUST = 0.0
 FAILSAFE_LEVEL = True
-
 THR_MIN = 0.10
 THR_MAX = 0.90
-
 MAX_TILT = 0.35
-
-# debug print period
 DBG_PERIOD_S = 0.2
-
 
 def wrap_pi(a: float) -> float:
     return (a + math.pi) % (2 * math.pi) - math.pi
 
+# =======================================================
+# [新增] 機載 GAI 接收端與 VLA 大腦初始化 (全域區域)
+# =======================================================
+app = FastAPI()
+gnode_reference = None
+vla_policy = None
+vla_device = torch.device("cpu")  # 強制 CPU 模式 (RX 570)
+
+class UserCommandRequest(BaseModel):
+    text_command: str
+
+def init_vla_brain():
+    global vla_policy, vla_device
+    print("⏳ [系統] 正在加載 SmolVLA 模型至機載端 CPU，請稍候...")
+    try:
+        vla_policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
+        vla_policy.to(vla_device)
+        vla_policy.eval()
+        print("✅ [系統] SmolVLA 模型加載完成，機載大腦已上線！")
+    except Exception as e:
+        print(f"❌ [系統] SmolVLA 加載失敗: {e}")
+
+@app.post("/onboard/command")
+def receive_gcs_command(payload: UserCommandRequest):
+    global gnode_reference, vla_policy, vla_device
+    user_text = payload.text_command
+    
+    if gnode_reference is None:
+        return {"status": "error", "message": "ROS 2 節點未準備就緒"}
+        
+    battery = getattr(gnode_reference, 'current_battery_pct', 100.0)
+    
+    # 1. 電量安全檢查 (低於 20% 強制攔截)
+    if battery < 20.0:
+        gnode_reference.get_logger().warn(f"⚠️ 電量過低 ({battery:.1f}%)，觸發保護！")
+        return {
+            "status": "rejected",
+            "reason": f"機載電量過低 ({battery:.1f}%)，強制拒絕執行",
+            "mission_plan": [{"action_type": "RTL", "param": 0}]
+        }
+        
+    if vla_policy is None:
+        return {"status": "error", "message": "VLA 模型尚未加載完成，請稍候再試"}
+        
+    gnode_reference.get_logger().info(f"🧠 [GAI 大腦] 開始解析指令: '{user_text}'")
+    
+    try:
+        with torch.no_grad():
+            # 這裡暫時輸出固定的 JSON 陣列，未來可替換為 vla_policy.select_action() 的動態輸出
+            mission_plan = [
+                {"action_type": "TAKEOFF", "param": 5},
+                {"action_type": "MOVE_FORWARD", "param": 3},
+                {"action_type": "RTL", "param": 0},
+                {"action_type": "LAND", "param": 0}
+            ]
+            
+            return {
+                "status": "success",
+                "battery_checked": battery,
+                "mission_plan": mission_plan
+            }
+    except Exception as e:
+        return {"status": "error", "message": f"推理失敗: {str(e)}"}
+
+def run_fastapi_background():
+    # 讓 API 運行於 Port 5000
+    uvicorn.run(app, host="0.0.0.0", port=5000, log_level="warning")
+# =======================================================
 
 class PX4DDS_UDP_Offboard_Attitude(Node):
     def __init__(self):
         super().__init__("px4dds_udp_offboard_attitude_bridge")
+
+        # [新增] 電量追蹤變數
+        self.current_battery_pct = 100.0
 
         # ---------- UDP ----------
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -75,37 +142,29 @@ class PX4DDS_UDP_Offboard_Attitude(Node):
         self.sock.setblocking(False)
         self.windows_addr = (WINDOWS_IP, UDP_SEND_PORT)
 
-        # ---------- 網路模擬佇列 ----------
         self.delayed_send_queue = deque()
         self.delayed_recv_queue = deque()
 
-        # ---------- State ----------
         self.have_lpos = False
         self.have_att = False
         self.x = self.y = self.z = 0.0
         self.vx = self.vy = self.vz = 0.0
-
         self.yaw_enu = 0.0
-        self._yaw_ned = 0.0  # debug
+        self._yaw_ned = 0.0 
 
-        # ---------- Last cmd ----------
         self.cmd_roll = 0.0
         self.cmd_pitch = 0.0
         self.cmd_yaw = 0.0
         self.cmd_thrust = 0.0
         self.last_cmd_time = 0.0
         self.have_cmd = False
-        self.echo_time = 0.0  # [新增] 用來儲存 Windows 傳過來的時間戳記
+        self.echo_time = 0.0  
                       
-        # ---------- Offboard ----------
         self.start_time = time.time()
         self.sent_offboard_cmd = False
         self.sent_arm_cmd = False
-
-        # ---------- Debug ----------
         self._last_dbg = 0.0
 
-        # ---------- QoS ----------
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
@@ -113,109 +172,58 @@ class PX4DDS_UDP_Offboard_Attitude(Node):
             depth=10,
         )
 
-        # ---------- Subscriptions ----------
-        self.create_subscription(
-            VehicleLocalPosition,
-            "/fmu/out/vehicle_local_position_v1",
-            self.lpos_cb,
-            qos,
-        )
-        self.create_subscription(
-            VehicleAttitude,
-            "/fmu/out/vehicle_attitude",
-            self.att_cb,
-            qos,
-        )
-        self.create_subscription(
-            BatteryStatus,
-            "/fmu/out/battery_status",
-            self.battery_cb,
-            qos,
-        )
+        self.create_subscription(VehicleLocalPosition, "/fmu/out/vehicle_local_position_v1", self.lpos_cb, qos)
+        self.create_subscription(VehicleAttitude, "/fmu/out/vehicle_attitude", self.att_cb, qos)
+        self.create_subscription(BatteryStatus, "/fmu/out/battery_status", self.battery_cb, qos)
 
-        # ---------- Publishers ----------
-        self.pub_offboard_mode = self.create_publisher(
-            OffboardControlMode, "/fmu/in/offboard_control_mode", 10
-        )
-        self.pub_att_sp = self.create_publisher(
-            VehicleAttitudeSetpoint, "/fmu/in/vehicle_attitude_setpoint_v1", 10
-        )
-        self.pub_vehicle_cmd = self.create_publisher(
-            VehicleCommand, "/fmu/in/vehicle_command", 10
-        )
-        self.pub_battery_state = self.create_publisher(
-            BatteryState, "/drone/battery_state", qos
-        )
+        self.pub_offboard_mode = self.create_publisher(OffboardControlMode, "/fmu/in/offboard_control_mode", 10)
+        self.pub_att_sp = self.create_publisher(VehicleAttitudeSetpoint, "/fmu/in/vehicle_attitude_setpoint_v1", 10)
+        self.pub_vehicle_cmd = self.create_publisher(VehicleCommand, "/fmu/in/vehicle_command", 10)
+        self.pub_battery_state = self.create_publisher(BatteryState, "/drone/battery_state", qos)
 
-        # ---------- Timers ----------
         self.create_timer(1.0 / SETPOINT_RATE_HZ, self.offboard_loop)
         self.create_timer(1.0 / CMD_RATE_HZ, self.receive_cmd_from_windows)
         self.create_timer(0.02, self.send_state_to_windows)
 
-        self.get_logger().info("[Bridge PX4DDS Offboard Attitude] Started with Network Simulation.")
-        self.get_logger().info(f"Loss Rate: {SIM_PACKET_LOSS_RATE*100}%, Delay: {SIM_NETWORK_DELAY*1000} ms")
-        self.get_logger().info(f"Windows IP: {WINDOWS_IP}")
-        self.get_logger().info(f"UDP listen(cmd): {UDP_RECV_PORT}, UDP send(state): {UDP_SEND_PORT}")
+        self.get_logger().info("[Bridge PX4DDS Offboard] Started with GAI Onboard Brain.")
 
-    # =========================
-    # PX4 DDS callbacks
-    # =========================
     def lpos_cb(self, msg: VehicleLocalPosition):
-        x_n, y_e, z_d = float(msg.x), float(msg.y), float(msg.z)
-        vx_n, vy_e, vz_d = float(msg.vx), float(msg.vy), float(msg.vz)
-
-        self.x = y_e
-        self.y = x_n
-        self.z = -z_d
-        self.vx = vy_e
-        self.vy = vx_n
-        self.vz = -vz_d
-
+        self.x = float(msg.y)
+        self.y = float(msg.x)
+        self.z = -float(msg.z)
+        self.vx = float(msg.vy)
+        self.vy = float(msg.vx)
+        self.vz = -float(msg.vz)
         self.have_lpos = True
 
     def att_cb(self, msg: VehicleAttitude):
-        q = msg.q  # [w, x, y, z]
-        qw, qx, qy, qz = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+        q = msg.q 
         try:
-            _, _, yaw_ned = euler_from_quaternion([qx, qy, qz, qw])
+            _, _, yaw_ned = euler_from_quaternion([float(q[1]), float(q[2]), float(q[3]), float(q[0])])
             self._yaw_ned = wrap_pi(yaw_ned)
             self.yaw_enu = wrap_pi((math.pi / 2.0) - yaw_ned)
             self.have_att = True
         except Exception:
             pass
-    # =========================
-    # [新增此段] PX4 Battery Callback 轉換邏輯
-    # =========================
+
     def battery_cb(self, msg: BatteryStatus):
-        # 將 PX4 底層電壓與剩餘比例轉換為 ROS 2 標準格式
         ros_batt_msg = BatteryState()
         ros_batt_msg.voltage = float(msg.voltage_v)
         ros_batt_msg.percentage = float(msg.remaining)
         
-        # 設定放電狀態
+        # [新增] 同步更新機載端全域電量
+        self.current_battery_pct = float(msg.remaining) * 100.0
+        
         ros_batt_msg.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_DISCHARGING
         ros_batt_msg.present = True
-        
-        # 發布至 /drone/battery_state 供 Web 前端更新 UI
         self.pub_battery_state.publish(ros_batt_msg)
-        self.get_logger().info(f"🔋 電池狀態更新: 電壓 {ros_batt_msg.voltage:.2f}V, 剩餘 {ros_batt_msg.percentage:.2f}%")
-    # =========================
-    # UDP: state -> Windows (加入延遲與掉包)
-    # =========================
+
     def send_state_to_windows(self):
         if self.have_lpos and self.have_att:
             if random.random() >= SIM_PACKET_LOSS_RATE:
                 try:
-                    # [修改] 直接打包 echo_time 回傳給 Windows
-                    pkt = struct.pack(
-                        "<7fd",
-                        self.x, self.y, self.z,
-                        self.vx, self.vy, self.vz,
-                        self.yaw_enu,
-                        self.echo_time,
-                    )
-                    execute_time = time.time() + SIM_NETWORK_DELAY
-                    self.delayed_send_queue.append((execute_time, pkt))
+                    pkt = struct.pack("<7fd", self.x, self.y, self.z, self.vx, self.vy, self.vz, self.yaw_enu, self.echo_time)
+                    self.delayed_send_queue.append((time.time() + SIM_NETWORK_DELAY, pkt))
                 except Exception:
                     pass
 
@@ -227,24 +235,15 @@ class PX4DDS_UDP_Offboard_Attitude(Node):
             except Exception:
                 pass
 
-    # =========================
-    # UDP: cmd <- Windows (加入延遲與掉包)
-    # =========================
     def receive_cmd_from_windows(self):
         while True:
             try:
                 data, _ = self.sock.recvfrom(1024)
-                
-                if random.random() < SIM_PACKET_LOSS_RATE:
-                    continue
-
-                process_time = time.time() + SIM_NETWORK_DELAY
-                self.delayed_recv_queue.append((process_time, data))
-                
+                if random.random() < SIM_PACKET_LOSS_RATE: continue
+                self.delayed_recv_queue.append((time.time() + SIM_NETWORK_DELAY, data))
             except socket.error:
                 break
-            except Exception as e:
-                self.get_logger().error(f"UDP recv error: {e}")
+            except Exception:
                 break
 
         current_time = time.time()
@@ -254,41 +253,25 @@ class PX4DDS_UDP_Offboard_Attitude(Node):
                 if len(data) == 16:
                     r, p, y, t = struct.unpack("<4f", data)
                 elif len(data) == 24:
-                    # [修改] 將收到的 Windows 時間戳記存入 self.echo_time
                     r, p, y, t, self.echo_time = struct.unpack("<4f d", data)
-                else:
-                    continue
+                else: continue
 
-                r = float(max(min(r, MAX_TILT), -MAX_TILT))
-                p = float(max(min(p, MAX_TILT), -MAX_TILT))
-                y = float(y)
-                t = float(max(min(t, THR_MAX), THR_MIN))
-
-                self.cmd_roll = r
-                self.cmd_pitch = p
-                self.cmd_yaw = y
-                self.cmd_thrust = t
+                self.cmd_roll = float(max(min(r, MAX_TILT), -MAX_TILT))
+                self.cmd_pitch = float(max(min(p, MAX_TILT), -MAX_TILT))
+                self.cmd_yaw = float(y)
+                self.cmd_thrust = float(max(min(t, THR_MAX), THR_MIN))
                 self.last_cmd_time = time.time() 
                 self.have_cmd = True
-
-            except Exception as e:
+            except Exception:
                 pass
 
-    # =========================
-    # PX4 Offboard loop
-    # =========================
     def offboard_loop(self):
         now = time.time()
-
         self.publish_offboard_control_mode()
 
         cmd_ok = self.have_cmd and ((now - self.last_cmd_time) <= HEARTBEAT_TIMEOUT_S)
-
         if cmd_ok:
-            roll = self.cmd_roll
-            pitch = self.cmd_pitch
-            yaw = self.cmd_yaw
-            thrust = self.cmd_thrust
+            roll, pitch, yaw, thrust = self.cmd_roll, self.cmd_pitch, self.cmd_yaw, self.cmd_thrust
         else:
             roll = 0.0 if FAILSAFE_LEVEL else self.cmd_roll
             pitch = 0.0 if FAILSAFE_LEVEL else self.cmd_pitch
@@ -297,26 +280,13 @@ class PX4DDS_UDP_Offboard_Attitude(Node):
 
         self.publish_attitude_setpoint(roll, pitch, yaw, thrust)
         
-        if (now - self._last_dbg) >= DBG_PERIOD_S:
-            self._last_dbg = now
-            self.get_logger().info(
-                f"ENU x={self.x:+.2f} y={self.y:+.2f} z={self.z:+.2f} | "
-                f"v={self.vx:+.2f},{self.vy:+.2f},{self.vz:+.2f} | "
-                f"yaw_enu={self.yaw_enu:+.2f} | "
-                f"cmd r={roll:+.2f} p={pitch:+.2f} y={yaw:+.2f} thr={thrust:+.2f} | "
-                f"cmd_ok={cmd_ok}"
-            )
-
         if (now - self.start_time) >= PRESETPOINT_SECONDS:
             if not self.sent_offboard_cmd:
                 self.send_set_mode_offboard()
                 self.sent_offboard_cmd = True
-                self.get_logger().info("Sent OFFBOARD mode command.")
-
             if not self.sent_arm_cmd:
                 self.send_arm_command()
                 self.sent_arm_cmd = True
-                self.get_logger().info("Sent ARM command.")
 
     def publish_offboard_control_mode(self):
         msg = OffboardControlMode()
@@ -326,8 +296,7 @@ class PX4DDS_UDP_Offboard_Attitude(Node):
         msg.acceleration = False
         msg.attitude = True
         msg.body_rate = False
-        if hasattr(msg, "actuator"):
-            msg.actuator = False
+        if hasattr(msg, "actuator"): msg.actuator = False
         self.pub_offboard_mode.publish(msg)
 
     def publish_attitude_setpoint(self, roll: float, pitch: float, yaw: float, thrust01: float):
@@ -335,8 +304,7 @@ class PX4DDS_UDP_Offboard_Attitude(Node):
         msg.timestamp = int(time.time() * 1e6)
         qx, qy, qz, qw = quaternion_from_euler(roll, pitch, yaw)
         msg.q_d = [float(qw), float(qx), float(qy), float(qz)]
-        thr = float(max(min(thrust01, THR_MAX), THR_MIN))
-        msg.thrust_body = [0.0, 0.0, -thr]
+        msg.thrust_body = [0.0, 0.0, -float(max(min(thrust01, THR_MAX), THR_MIN))]
         self.pub_att_sp.publish(msg)
 
     def send_arm_command(self):
@@ -345,28 +313,32 @@ class PX4DDS_UDP_Offboard_Attitude(Node):
     def send_set_mode_offboard(self):
         self.send_vehicle_command(command=VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0)
 
-    def send_vehicle_command(self, command: int, param1=0.0, param2=0.0, param3=0.0, param4=0.0, param5=0.0, param6=0.0, param7=0.0):
+    def send_vehicle_command(self, command: int, param1=0.0, param2=0.0):
         msg = VehicleCommand()
         msg.timestamp = int(time.time() * 1e6)
-        msg.param1 = float(param1)
-        msg.param2 = float(param2)
-        msg.param3 = float(param3)
-        msg.param4 = float(param4)
-        msg.param5 = float(param5)
-        msg.param6 = float(param6)
-        msg.param7 = float(param7)
+        msg.param1, msg.param2 = float(param1), float(param2)
         msg.command = int(command)
-        msg.target_system = 1
-        msg.target_component = 1
-        msg.source_system = 1
-        msg.source_component = 1
+        msg.target_system = msg.target_component = msg.source_system = msg.source_component = 1
         msg.from_external = True
         self.pub_vehicle_cmd.publish(msg)
 
-
+# =======================================================
+# 程式進入點
+# =======================================================
 def main(args=None):
+    global gnode_reference
     rclpy.init(args=args)
     node = PX4DDS_UDP_Offboard_Attitude()
+    gnode_reference = node  # 將 ROS 節點綁定給 API，讓它能讀取電量
+    
+    # 1. 預先加載 VLA 模型
+    init_vla_brain()
+    
+    # 2. 啟動背景 API 接收地面站文字指令
+    api_thread = threading.Thread(target=run_fastapi_background, daemon=True)
+    api_thread.start()
+    node.get_logger().info("🚀 機載端 GAI 接收服務已在 Port 5000 背景啟動。")
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -374,7 +346,6 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == "__main__":
     main()
