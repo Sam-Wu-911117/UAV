@@ -184,7 +184,7 @@ class VLA_MissionManager:
         self.wp_idx = 0
         self.state = "FLYING_TO_WP"
         self.state_start_time = 0.0
-        self.fan_cmd = 0
+        
 
     def update(self, current_x, current_y, current_time):
         # 任務結束，啟動降落程序
@@ -209,21 +209,12 @@ class VLA_MissionManager:
             self.fan_cmd = 0
             # 模擬 Jetson 上 smolVLA 處理影像需要 2.0 秒
             if current_time - self.state_start_time > 2.0:
-                self.state = "FAN_BLOWING"
-                self.state_start_time = current_time
-                print(f"🧠 VLA 決策：發現乾性髒污，啟動 300g 暴力風扇！")
-
-        elif self.state == "FAN_BLOWING":
-            self.fan_cmd = 1  # 觸發風扇 PWM
-            # 模擬風扇持續吹除 3.0 秒
-            if current_time - self.state_start_time > 3.0:
                 self.state = "FLYING_TO_WP"
-                self.fan_cmd = 0
-                self.wp_idx += 1
-                print(f"💨 清理完畢，前往下一個巡檢點！\n")
+                self.state_start_time = current_time
+                print(f"🧠 VVLA 推論完成，前往下一個巡檢點！\n")
 
-        # 此處省略前饋速度與加速度 (直接給 0.0 讓 IT2-PFC 自行追蹤位置誤差)
-        return tgt_x, tgt_y, tgt_z, 0.0, 0.0, 0.0, 0.0, self.state, self.fan_cmd
+               # 此處省略前饋速度與加速度 (直接給 0.0 讓 IT2-PFC 自行追蹤位置誤差)
+        return tgt_x, tgt_y, tgt_z, 0.0, 0.0, 0.0, 0.0, self.state
 
 # ==========================================
 # 4. 主程式
@@ -289,7 +280,7 @@ def main():
                 elapsed = curr_time - start_time
 
                # 1. 軌跡生成與任務狀態更新
-                tgt_x, tgt_y, tgt_z, tgt_vx, tgt_vy, tgt_ax, tgt_ay, mode, fan_cmd = mission_manager.update(x, y, curr_time)
+                tgt_x, tgt_y, tgt_z, tgt_vx, tgt_vy, tgt_ax, tgt_ay, mode = mission_manager.update(x, y, curr_time)
 
                 # 當處於降落模式時，修改 Z 軸目標高度
                 if mode == "Land":
@@ -361,7 +352,7 @@ def main():
                     last_send_time = curr_time
 
                 # 紀錄資料供繪圖
-                log_data.append([elapsed, x, y, z, tgt_x, tgt_y, tgt_z, is_triggered, fan_cmd])
+                log_data.append([elapsed, x, y, z, tgt_x, tgt_y, tgt_z, is_triggered])
 
                 # 終端機狀態輸出
                 if curr_time - last_print_time >= 0.2:
