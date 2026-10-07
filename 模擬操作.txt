@@ -1,0 +1,31 @@
+階段一：啟動下位機與實體模擬環境 (WSL 2 / Ubuntu 22.04)
+啟動飛控與物理引擎
+開啟第一個 Ubuntu 終端機，進入 PX4 目錄並啟動 Gazebo 3D 模擬。
+
+Bash
+cd ~/PX4-Autopilot
+make px4_sitl gz_x500
+啟動 DDS 通訊神經網路
+開啟第二個 Ubuntu 終端機，啟動 Micro XRCE-DDS Agent，讓 PX4 的內部訊息能與外掛的 ROS 2 系統對接。
+
+Bash
+MicroXRCEAgent udp4 -p 8888
+啟動狀態收發與轉換節點
+開啟第三個 Ubuntu 終端機，載入工作空間的環境變數後，執行您的本機 UDP 接收程式，讓其在 127.0.0.1:5006 待命接收姿態指令。
+
+Bash
+source ~/ros2_ws/install/setup.bash
+python3 delaypackage.py
+階段二：啟動上位機監控與控制大腦 (Windows)
+啟動地面監控站
+在 Windows 直接點擊執行 QGroundControl (QGC)。等待系統自動透過 localhost:14550 連線，並確認聽見 "Vehicle 1 Connected" 的語音提示，畫面上應顯示虛擬無人機的當前姿態與地圖位置。
+
+啟動控制演算法與發送端
+開啟 Windows 端的命令提示字元 (cmd) 或 VS Code 終端機，執行您的控制發送腳本，開始向 127.0.0.1:5005 拋送 UDP 控制封包。
+
+DOS
+python gcetm0415.py
+執行核心控制邏輯 (MATLAB 協同)
+若進入完整實驗階段，請在 Windows 開啟 MATLAB / Simulink，執行您的新型區間二型多項式模糊控制器。讓上位機專心計算出歸屬函數的上下界與誤差狀態，並將精準的推力與尤拉角控制力矩，透過上述打通的網路控制系統架構，即時回傳給 WSL 2 中的無人機執行。
+
+只要嚴格遵守「先下位機 (軀體/神經)、後上位機 (監控/大腦)」的啟動順序，您的模擬環境就能維持最高的連線穩定度。
