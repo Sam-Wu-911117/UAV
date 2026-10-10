@@ -13,7 +13,7 @@ from pathlib import Path
 # 1. 控制參數設定 (對齊 init_params.m)
 # ==========================================
 # UAV 參數
-UAV_MASS = 3.6
+UAV_MASS = 3.5
 HOVER_FORCE = UAV_MASS * 9.81
 
 # 高度控制
@@ -28,8 +28,8 @@ THR_MAX = 0.90
 
 # XY ETM 控制
 OMEGA_POS = np.array([[282.0784, 501.9677], [501.9677, 893.5577]], dtype=float)
-F1_POS = np.array([-2.4604, -4.4041], dtype=float)
-F2_POS = np.array([-2.9273, -5.2102], dtype=float)
+F1_POS = np.array([-5.5496, -9.5895], dtype=float)
+F2_POS = np.array([-5.5485, -9.5895], dtype=float)
 AR_POS = np.array([[0.0, 1.0], [-4.0, -4.0]], dtype=float)
 
 SIGMA_POS = 0.00
@@ -49,22 +49,22 @@ DT_MIN = 0.01
 DT_MAX = 0.03
 
 # 軌跡與任務參數
-TARGET_Z = 5.0
+TARGET_Z = 2.0
 LANDING_SPEED = 0.5
 ENABLE_FIGURE8 = True
 HOVER_BEFORE_TRAJ = 3.0
-FIG8_A = 10.0
-FIG8_B = 10.0
+FIG8_A = 5.0
+FIG8_B = 5.0
 FIG8_OMEGA = 0.052
 FIG8_PERIOD = 2.0 * math.pi / FIG8_OMEGA
 FIG8_LOOPS = 1
 TOTAL_FIG8_TIME = FIG8_PERIOD * FIG8_LOOPS
 
 # 陣風模擬參數
-DISX = -6.0
-DISY = 8.0
-DISSTART = 30.0
-DISEND = 33.0
+DISX = 8.0
+DISY = 0
+DISSTART = 100.37
+DISEND = 100.87
 
 # ==========================================
 # 2. ETM 核心控制器類別
