@@ -169,52 +169,29 @@ class Fuzzy_ETM_Core:
         return self.last_control_u, triggered
 
 # ==========================================
-# 3. VLA 航點與風扇任務管理器
+# 3. 軌跡生成器
 # ==========================================
-class VLA_MissionManager:
-    def __init__(self, target_z=5.0):
-        self.target_z = target_z
-        # 預設的 TSP 髒污點路徑 (X, Y)
-        self.waypoints = [
-            (12.0, 5.0),
-            (8.0, 15.0),
-            (18.0, 25.0),
-            (25.0, 18.0)
-        ]
-        self.wp_idx = 0
-        self.state = "FLYING_TO_WP"
-        self.state_start_time = 0.0
-        
+def generate_trajectory(home_x, home_y, elapsed):
+    t_hover_end = HOVER_BEFORE_TRAJ
+    t_fig8_end = t_hover_end + TOTAL_FIG8_TIME
 
-    def update(self, current_x, current_y, current_time):
-        # 任務結束，啟動降落程序
-        if self.wp_idx >= len(self.waypoints):
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "Land", 0
-
-        tgt_x, tgt_y = self.waypoints[self.wp_idx]
-        tgt_z = self.target_z
-        
-        # 計算與目標航點的水平距離
-        dist = math.hypot(current_x - tgt_x, current_y - tgt_y)
-
-        # --- 狀態機切換邏輯 ---
-        if self.state == "FLYING_TO_WP":
-            self.fan_cmd = 0
-            if dist < 0.3:  # 誤差小於 0.3m 視為抵達
-                self.state = "VLA_INFER"
-                self.state_start_time = current_time
-                print(f"\n🎯 抵達航點 {self.wp_idx} ({tgt_x}, {tgt_y})，啟動 VLA 視覺推論...")
-
-        elif self.state == "VLA_INFER":
-            self.fan_cmd = 0
-            # 模擬 Jetson 上 smolVLA 處理影像需要 2.0 秒
-            if current_time - self.state_start_time > 2.0:
-                self.state = "FLYING_TO_WP"
-                self.state_start_time = current_time
-                print(f"🧠 VVLA 推論完成，前往下一個巡檢點！\n")
-
-               # 此處省略前饋速度與加速度 (直接給 0.0 讓 IT2-PFC 自行追蹤位置誤差)
-        return tgt_x, tgt_y, tgt_z, 0.0, 0.0, 0.0, 0.0, self.state
+    if not ENABLE_FIGURE8 or elapsed < t_hover_end:
+        return home_x, home_y, TARGET_Z, 0.0, 0.0, 0.0, 0.0, "Hover"
+    elif elapsed < t_fig8_end:
+        t = elapsed - t_hover_end
+        w = FIG8_OMEGA
+        target_x = home_x + FIG8_A * math.sin(w * t)
+        target_y = home_y + FIG8_B * math.sin(w * t) * math.cos(w * t)
+        target_z = TARGET_Z
+        target_vx = FIG8_A * w * math.cos(w * t)
+        target_vy = FIG8_B * w * math.cos(2.0 * w * t)
+        target_ax = -FIG8_A * (w**2) * math.sin(w * t)
+        target_ay = -2.0 * FIG8_B * (w**2) * math.sin(2.0 * w * t)
+        return target_x, target_y, target_z, target_vx, target_vy, target_ax, target_ay, "Fig8"
+    else:
+        t_land = elapsed - t_fig8_end
+        target_z = max(0.0, TARGET_Z - LANDING_SPEED * t_land)
+        return home_x, home_y, target_z, 0.0, 0.0, 0.0, 0.0, "Land"
 
 # ==========================================
 # 4. 主程式
@@ -236,9 +213,7 @@ def main():
     etm_pos_x = Fuzzy_ETM_Core(OMEGA_POS, F1_POS, F2_POS, AR_POS)
     etm_pos_y = Fuzzy_ETM_Core(OMEGA_POS, F1_POS, F2_POS, AR_POS)
     
-    # [新增] 初始化 VLA 任務管理器
-    mission_manager = VLA_MissionManager(target_z=TARGET_Z)
-
+  
     # 紀錄與狀態變數
     log_data = []
     home_initialized = False
@@ -280,12 +255,7 @@ def main():
                 elapsed = curr_time - start_time
 
                # 1. 軌跡生成與任務狀態更新
-                tgt_x, tgt_y, tgt_z, tgt_vx, tgt_vy, tgt_ax, tgt_ay, mode = mission_manager.update(x, y, curr_time)
-
-                # 當處於降落模式時，修改 Z 軸目標高度
-                if mode == "Land":
-                    t_land = curr_time - mission_manager.state_start_time
-                    tgt_z = max(0.0, TARGET_Z - LANDING_SPEED * t_land)
+                tgt_x, tgt_y, tgt_z, tgt_vx, tgt_vy, tgt_ax, tgt_ay, mode = generate_trajectory(home_x, home_y, elapsed)
 
                 # 2. Z 軸 ETM 與推力傾角補償
                 u_accel, trig_z = alt_ctrl.update(np.array([z, vz], dtype=float), tgt_z, dt)
@@ -347,7 +317,7 @@ def main():
                 # 若 ETM 觸發，或超過 0.4s (防止 Pi 端的 CMD_TIMEOUT=0.5 觸發安全模式)，則發送
                 if is_triggered or (time_since_last_send > 0.4):
                     # 打包給 Pi: <4fd> = roll, pitch, yaw_rate, thrust, pc_ts
-                    msg = struct.pack("<4fdi", target_roll, target_pitch, 0.0, thrust_cmd, curr_time)
+                    msg = struct.pack("<4fd", target_roll, target_pitch, 0.0, thrust_cmd, curr_time)
                     sock_send.sendto(msg, (PI_IP, UDP_SEND_PORT))
                     last_send_time = curr_time
 
