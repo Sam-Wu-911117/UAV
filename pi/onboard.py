@@ -22,9 +22,7 @@ from collections import deque
 from fastapi import FastAPI
 from pydantic import BaseModel
 import uvicorn
-import torch
-# 若出現錯誤，請確認已在 WSL 執行: pip install -e ".[smolvla]"
-from lerobot.common.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+import requests
 
 from px4_msgs.msg import (
     VehicleLocalPosition,
@@ -66,25 +64,15 @@ def wrap_pi(a: float) -> float:
 app = FastAPI()
 gnode_reference = None
 vla_policy = None
-vla_device = torch.device("cpu")  # 強制 CPU 模式 (RX 570)
 
 class UserCommandRequest(BaseModel):
     text_command: str
 
-def init_vla_brain():
-    global vla_policy, vla_device
-    print("⏳ [系統] 正在加載 SmolVLA 模型至機載端 CPU，請稍候...")
-    try:
-        vla_policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
-        vla_policy.to(vla_device)
-        vla_policy.eval()
-        print("✅ [系統] SmolVLA 模型加載完成，機載大腦已上線！")
-    except Exception as e:
-        print(f"❌ [系統] SmolVLA 加載失敗: {e}")
+
 
 @app.post("/onboard/command")
 def receive_gcs_command(payload: UserCommandRequest):
-    global gnode_reference, vla_policy, vla_device
+    global gnode_reference
     user_text = payload.text_command
     
     if gnode_reference is None:
@@ -92,37 +80,33 @@ def receive_gcs_command(payload: UserCommandRequest):
         
     battery = getattr(gnode_reference, 'current_battery_pct', 100.0)
     
-    # 1. 電量安全檢查 (低於 20% 強制攔截)
     if battery < 20.0:
-        gnode_reference.get_logger().warn(f"⚠️ 電量過低 ({battery:.1f}%)，觸發保護！")
         return {
             "status": "rejected",
-            "reason": f"機載電量過低 ({battery:.1f}%)，強制拒絕執行",
+            "reason": f"機載電量過低 ({battery:.1f}%)",
             "mission_plan": [{"action_type": "RTL", "param": 0}]
         }
         
-    if vla_policy is None:
-        return {"status": "error", "message": "VLA 模型尚未加載完成，請稍候再試"}
-        
-    gnode_reference.get_logger().info(f"🧠 [GAI 大腦] 開始解析指令: '{user_text}'")
+    gnode_reference.get_logger().info(f"呼叫右腦解析: '{user_text}'")
     
     try:
-        with torch.no_grad():
-            # 這裡暫時輸出固定的 JSON 陣列，未來可替換為 vla_policy.select_action() 的動態輸出
-            mission_plan = [
-                {"action_type": "TAKEOFF", "param": 5},
-                {"action_type": "MOVE_FORWARD", "param": 3},
-                {"action_type": "RTL", "param": 0},
-                {"action_type": "LAND", "param": 0}
-            ]
-            
+        # [微服務架構] 向本機 5001 Port 的右腦發起推理請求
+        res = requests.post("http://127.0.0.1:5001/vla/infer", json={
+            "text_command": user_text,
+            "battery": battery
+        }, timeout=15).json()
+        
+        if res.get("status") == "success":
             return {
                 "status": "success",
                 "battery_checked": battery,
-                "mission_plan": mission_plan
+                "mission_plan": res.get("mission_plan", [])
             }
-    except Exception as e:
-        return {"status": "error", "message": f"推理失敗: {str(e)}"}
+        else:
+            return {"status": "error", "message": res.get("message")}
+            
+    except requests.exceptions.ConnectionError:
+        return {"status": "error", "message": "右腦 (VLA微服務) 尚未啟動或連線失敗"}
 
 def run_fastapi_background():
     # 讓 API 運行於 Port 5000
@@ -222,7 +206,15 @@ class PX4DDS_UDP_Offboard_Attitude(Node):
         if self.have_lpos and self.have_att:
             if random.random() >= SIM_PACKET_LOSS_RATE:
                 try:
-                    pkt = struct.pack("<7fd", self.x, self.y, self.z, self.vx, self.vy, self.vz, self.yaw_enu, self.echo_time)
+                    pkt = struct.pack(
+                        "<9fd",
+                        self.x, self.y, self.z,
+                        self.vx, self.vy, self.vz,
+                        self.yaw_enu,
+                        self.current_battery_pct,
+                        getattr(self, 'current_battery_volt', 25.4),
+                        self.echo_time
+                    )
                     self.delayed_send_queue.append((time.time() + SIM_NETWORK_DELAY, pkt))
                 except Exception:
                     pass
@@ -331,9 +323,7 @@ def main(args=None):
     node = PX4DDS_UDP_Offboard_Attitude()
     gnode_reference = node  # 將 ROS 節點綁定給 API，讓它能讀取電量
     
-    # 1. 預先加載 VLA 模型
-    init_vla_brain()
-    
+       
     # 2. 啟動背景 API 接收地面站文字指令
     api_thread = threading.Thread(target=run_fastapi_background, daemon=True)
     api_thread.start()
