@@ -169,25 +169,57 @@ class Fuzzy_ETM_Core:
         return self.last_control_u, triggered
 
 # ==========================================
-# 3. 軌跡生成器
+# 3. 軌跡生成器 (加入 VLA 中途懸停模擬)
 # ==========================================
+# 新增模擬參數：定義何時介入與懸停多久
+VLA_HOVER_START = 8.0     # 在總飛行時間第 8 秒時觸發懸停
+VLA_HOVER_DURATION = 4.0  # 懸停持續 4 秒
+
 def generate_trajectory(home_x, home_y, elapsed):
     t_hover_end = HOVER_BEFORE_TRAJ
-    t_fig8_end = t_hover_end + TOTAL_FIG8_TIME
+    # 總八字時間必須加上懸停的時間，以免提早進入降落模式
+    t_fig8_end = t_hover_end + TOTAL_FIG8_TIME + VLA_HOVER_DURATION 
 
     if not ENABLE_FIGURE8 or elapsed < t_hover_end:
         return home_x, home_y, TARGET_Z, 0.0, 0.0, 0.0, 0.0, "Hover"
+        
     elif elapsed < t_fig8_end:
-        t = elapsed - t_hover_end
+        t_active = elapsed - t_hover_end # 進入八字後的實際經過時間
+        
+        # --- 時間凍結邏輯 ---
+        if elapsed < VLA_HOVER_START:
+            # 1. 尚未觸發：正常飛行
+            t_eff = t_active
+            mode = "Fig8"
+        elif elapsed < VLA_HOVER_START + VLA_HOVER_DURATION:
+            # 2. VLA 介入：時間凍結在觸發那一刻
+            t_eff = VLA_HOVER_START - t_hover_end
+            mode = "VLA_Wait"
+        else:
+            # 3. 懸停結束：時間繼續流動 (需扣除懸停消耗掉的時間)
+            t_eff = t_active - VLA_HOVER_DURATION
+            mode = "Fig8_Res"
+            
         w = FIG8_OMEGA
-        target_x = home_x + FIG8_A * math.sin(w * t)
-        target_y = home_y + FIG8_B * math.sin(w * t) * math.cos(w * t)
+        # 位置指令 (利用 t_eff 計算，懸停時位置會卡死在同一個點)
+        target_x = home_x + FIG8_A * math.sin(w * t_eff)
+        target_y = home_y + FIG8_B * math.sin(w * t_eff) * math.cos(w * t_eff)
         target_z = TARGET_Z
-        target_vx = FIG8_A * w * math.cos(w * t)
-        target_vy = FIG8_B * w * math.cos(2.0 * w * t)
-        target_ax = -FIG8_A * (w**2) * math.sin(w * t)
-        target_ay = -2.0 * FIG8_B * (w**2) * math.sin(2.0 * w * t)
-        return target_x, target_y, target_z, target_vx, target_vy, target_ax, target_ay, "Fig8"
+        
+        # 速度與加速度指令計算
+        if mode == "VLA_Wait":
+            # 懸停狀態下，強制要求速度與加速度為 0，測試控制器煞車能力
+            target_vx = target_vy = 0.0
+            target_ax = target_ay = 0.0
+        else:
+            # 正常飛行時，計算微分
+            target_vx = FIG8_A * w * math.cos(w * t_eff)
+            target_vy = FIG8_B * w * math.cos(2.0 * w * t_eff)
+            target_ax = -FIG8_A * (w**2) * math.sin(w * t_eff)
+            target_ay = -2.0 * FIG8_B * (w**2) * math.sin(2.0 * w * t_eff)
+            
+        return target_x, target_y, target_z, target_vx, target_vy, target_ax, target_ay, mode
+        
     else:
         t_land = elapsed - t_fig8_end
         target_z = max(0.0, TARGET_Z - LANDING_SPEED * t_land)
