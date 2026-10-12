@@ -49,7 +49,7 @@ DT_MIN = 0.01
 DT_MAX = 0.03
 
 # 軌跡與任務參數
-TARGET_Z = 5.0
+TARGET_Z = 2.5
 LANDING_SPEED = 0.5
 ENABLE_FIGURE8 = True
 HOVER_BEFORE_TRAJ = 3.0
@@ -172,7 +172,7 @@ class Fuzzy_ETM_Core:
 # 3. 軌跡生成器 (加入 VLA 中途懸停模擬)
 # ==========================================
 # 新增模擬參數：定義何時介入與懸停多久
-VLA_HOVER_START = 8.0     # 在總飛行時間第 8 秒時觸發懸停
+VLA_HOVER_START = 13.0     # 在總飛行時間第 8 秒時觸發懸停
 VLA_HOVER_DURATION = 4.0  # 懸停持續 4 秒
 
 def generate_trajectory(home_x, home_y, elapsed):

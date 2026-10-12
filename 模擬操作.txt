@@ -5,7 +5,7 @@
 Bash
 cd ~/PX4-Autopilot
 make px4_sitl gz_x500
-PX4_HOME_LAT=23.5629152549872 PX4_HOME_LON=120.46868164153 PX4_HOME_ALT=10 PX4_HOME_DIR=90 make px4_sitl gz_x500
+PX4_GZ_WORLD=solar_farm PX4_HOME_LAT=23.5629152549872 PX4_HOME_LON=120.46868164153 PX4_HOME_ALT=10 PX4_HOME_DIR=90 make px4_sitl gz_x500_depth
 啟動 DDS 通訊神經網路
 開啟第二個 Ubuntu 終端機，啟動 Micro XRCE-DDS Agent，讓 PX4 的內部訊息能與外掛的 ROS 2 系統對接。
 
