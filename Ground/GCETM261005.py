@@ -21,15 +21,15 @@ OMEGA_ALT = np.array([[11.2683, 16.5707], [16.5707, 25.0074]], dtype=float)
 F1_ALT = np.array([-8.1979, -12.7244], dtype=float)
 SIGMA_ALT = 0.00
 AR_ALT = np.array([[0.0, 1.0], [-4.0, -4.0]], dtype=float)
-HOVER_THRUST = 0.52
+HOVER_THRUST = 0.65
 THRUST_SCALE = 0.045
 THR_MIN = 0.10
 THR_MAX = 0.90
 
 # XY ETM 控制
 OMEGA_POS = np.array([[282.0784, 501.9677], [501.9677, 893.5577]], dtype=float)
-F1_POS = np.array([-5.5496, -9.5895], dtype=float)
-F2_POS = np.array([-5.5485, -9.5895], dtype=float)
+F1_POS = np.array([-2.4604, -4.4041], dtype=float)
+F2_POS = np.array([-2.9273, -5.2102], dtype=float)
 AR_POS = np.array([[0.0, 1.0], [-4.0, -4.0]], dtype=float)
 
 SIGMA_POS = 0.00
@@ -49,22 +49,22 @@ DT_MIN = 0.01
 DT_MAX = 0.03
 
 # 軌跡與任務參數
-TARGET_Z = 2.0
+TARGET_Z = 5.0
 LANDING_SPEED = 0.5
 ENABLE_FIGURE8 = True
 HOVER_BEFORE_TRAJ = 3.0
-FIG8_A = 5.0
-FIG8_B = 5.0
+FIG8_A = 10.0
+FIG8_B = 10.0
 FIG8_OMEGA = 0.052
 FIG8_PERIOD = 2.0 * math.pi / FIG8_OMEGA
 FIG8_LOOPS = 1
 TOTAL_FIG8_TIME = FIG8_PERIOD * FIG8_LOOPS
 
 # 陣風模擬參數
-DISX = 8.0
+DISX = 0
 DISY = 0
-DISSTART = 100.37
-DISEND = 100.87
+DISSTART = 30.0
+DISEND = 33.0
 
 # ==========================================
 # 2. ETM 核心控制器類別
@@ -336,7 +336,7 @@ def main():
                 u_roll, trig_y = etm_pos_y.update(np.array([err_b_y, err_b_vy], dtype=float), 0.0, dt, curr_time)
 
                 target_roll = float(np.clip(-u_roll + ff_roll_cmd + wind_roll_effect, -ROLL_PITCH_LIMIT, ROLL_PITCH_LIMIT))
-                target_pitch = float(np.clip(u_pitch + ff_pitch_cmd + wind_pitch_effect, -ROLL_PITCH_LIMIT, ROLL_PITCH_LIMIT))
+                target_pitch = float(np.clip(-u_pitch + ff_pitch_cmd + wind_pitch_effect, -ROLL_PITCH_LIMIT, ROLL_PITCH_LIMIT))
                 
                 # 記憶角度以供下一次迴圈進行傾角補償
                 last_cmd_roll = target_roll
