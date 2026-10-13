@@ -11,7 +11,7 @@ PX4_GZ_WORLD=solar_farm PX4_HOME_LAT=23.5629152549872 PX4_HOME_LON=120.468681641
 
 Bash
 MicroXRCEAgent udp4 -p 8888
-啟動狀態收發與轉換節點
+啟動狀態收發與轉換節點 PX4 飛控的 telemetry 數據能夠進入 ROS 2 的網路
 開啟第三個 Ubuntu 終端機，載入工作空間的環境變數後，執行您的本機 UDP 接收程式，讓其在 127.0.0.1:5006 待命接收姿態指令。
 
 Bash
@@ -24,7 +24,24 @@ python3 delaypackage.py
 啟動控制演算法與發送端
 開啟 Windows 端的命令提示字元 (cmd) 或 VS Code 終端機，執行您的控制發送腳本，開始向 127.0.0.1:5005 拋送 UDP 控制封包。
 
-DOS
+啟動 Gazebo 視覺橋接器 (終端機 3)
+將 Gazebo 專屬的影像訊號抽取出，轉換為標準的 ROS 2 影像封包 (純淨系統環境)。
+cd ~/UAV/pi
+./start_vision_bridge.sh
+
+啟動「眼睛」：ROS 2 影像發送端 (終端機 4)
+在系統預設的 Python 3.10 環境中，訂閱 ROS 2 影像並透過 UDP 廣播。
+cd ~/UAV
+python3 ros_vision_sender.py
+
+啟動「大腦」：SmolVLA 接收與推論端 (終端機 5)
+切換至獨立的 AI 工作區，啟動 Python 3.12 虛擬環境接收影像，這裡將是掛載 AI 模型的地方。
+cd ~/lerobot
+source vla_312_envy/bin/activate
+python vla_inference.py
+
+
+DOS (GCS)
 python gcetm0415.py
 執行核心控制邏輯 (MATLAB 協同)
 若進入完整實驗階段，請在 Windows 開啟 MATLAB / Simulink，執行您的新型區間二型多項式模糊控制器。讓上位機專心計算出歸屬函數的上下界與誤差狀態，並將精準的推力與尤拉角控制力矩，透過上述打通的網路控制系統架構，即時回傳給 WSL 2 中的無人機執行。
