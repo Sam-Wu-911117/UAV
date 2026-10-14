@@ -26,12 +26,16 @@ python3 delaypackage.py
 
 啟動 Gazebo 視覺橋接器 (終端機 3)
 將 Gazebo 專屬的影像訊號抽取出，轉換為標準的 ROS 2 影像封包 (純淨系統環境)。
-cd ~/UAV/pi
-./start_vision_bridge.sh
+pkill -9 -f _ros2_daemon
+source /opt/ros/humble/setup.bash
+unset ROS_LOCALHOST_ONLY
+export GZ_IP=127.0.0.1
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+ros2 run ros_gz_bridge parameter_bridge /world/solar_farm/model/x500_depth_0/link/camera_link/sensor/IMX214/image@sensor_msgs/msg/Image[gz.msgs.Image
 
 啟動「眼睛」：ROS 2 影像發送端 (終端機 4)
 在系統預設的 Python 3.10 環境中，訂閱 ROS 2 影像並透過 UDP 廣播。
-cd ~/UAV
+cd ~/UAV/pi
 python3 ros_vision_sender.py
 
 啟動「大腦」：SmolVLA 接收與推論端 (終端機 5)
