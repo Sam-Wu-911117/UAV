@@ -16,7 +16,6 @@ import numpy as np
 UAV_MASS = 3.5
 HOVER_FORCE = UAV_MASS * 9.81
 
-# 高度與 XY ETM 參數
 OMEGA_ALT = np.array([[11.2683, 16.5707], [16.5707, 25.0074]], dtype=float)
 F1_ALT = np.array([-8.1979, -12.7244], dtype=float)
 SIGMA_ALT = 0.00
@@ -45,20 +44,20 @@ ROLL_PITCH_LIMIT = 0.6
 DT_MIN, DT_MAX = 0.01, 0.03
 
 # ==========================================
-# 🎯 任務與路徑參數 (已對齊 Gazebo 真實模型)
+# 🎯 任務與路徑參數 (太陽能板 5.0m + 上方 1.5m = 6.5m)
 # ==========================================
-# 太陽能板基準高度約 5.0m，設定上方 1.5m 飛行 -> 絕對高度 6.5m
 TARGET_Z = 6.5
 LANDING_SPEED = 0.5
 HOVER_BEFORE_TRAJ = 3.0
 TRANSITION_DURATION = 4.0
 
-# 已知髒污點清單 (相對於起飛點 0,0 的絕對座標偏移量)
 KNOWN_DEFECTS = [
-    (3.0, 1.10),  # 缺陷 1：第一排面板 (落葉群)
-    (5.5, 2.10)   # 缺陷 2：第二排面板 (大面積泥沙)
+    (3.0, 1.10),  # 髒污區 1：第一排面板 (落葉群)
+    (5.5, 2.10)   # 髒污區 2：第二排面板 (大面積泥沙)
 ]
 
+SHM_REQ_TEMP = '/dev/shm/uav_req_tmp.json'
+SHM_REQ_PATH = '/dev/shm/uav_req.json'
 SHM_ACT_PATH = '/dev/shm/uav_action.json'
 
 # ==========================================
@@ -122,7 +121,7 @@ class Fuzzy_ETM_Core:
         return self.last_control_u, triggered
 
 # ==========================================
-# 3. 輔助函式
+# 3. 輔助函式 (按需觸發拍照與讀取結果)
 # ==========================================
 def min_jerk(t, T, p0, pf):
     t = max(0.0, min(t, T))
@@ -133,15 +132,27 @@ def min_jerk(t, T, p0, pf):
     acc = (pf - p0) / (T**2) * (60*tau - 180*tau**2 + 120*tau3)
     return pos, vel, acc
 
-def read_vla_cleaning_duration(last_event_id):
+def request_vla_inference(req_id, wp_index):
+    """當抵達髒污點時，向終端機 2 發出單次拍照與 VLA 推論請求"""
+    req_data = {
+        "req_id": int(req_id),
+        "wp_index": int(wp_index),
+        "timestamp": time.time()
+    }
+    with open(SHM_REQ_TEMP, 'w') as f:
+        json.dump(req_data, f)
+    os.replace(SHM_REQ_TEMP, SHM_REQ_PATH)
+
+def read_vla_cleaning_duration(expected_req_id):
+    """只讀取與當前 req_id 完全匹配的 VLA 推論結果"""
     if not os.path.exists(SHM_ACT_PATH):
         return None
     try:
         with open(SHM_ACT_PATH, 'r') as f:
             act = json.load(f)
-        if act.get("action") == "CLEAN_DURATION" and act.get("event_id", -1) > last_event_id:
+        if act.get("action") == "CLEAN_DURATION" and act.get("event_id", -1) == expected_req_id:
             return act
-    except:
+    except Exception:
         pass
     return None
 
@@ -149,9 +160,10 @@ def read_vla_cleaning_duration(last_event_id):
 # 4. 主程式
 # ==========================================
 def main():
-    if os.path.exists(SHM_ACT_PATH):
-        try: os.remove(SHM_ACT_PATH)
-        except: pass
+    for p in [SHM_REQ_PATH, SHM_ACT_PATH]:
+        if os.path.exists(p):
+            try: os.remove(p)
+            except OSError: pass
 
     PI_IP = input("請輸入樹莓派 IP: ").strip()
     UDP_LISTEN_PORT, UDP_SEND_PORT = 5006, 5005
@@ -176,10 +188,10 @@ def main():
     start_pos_x = start_pos_y = 0.0
     transition_start_time = wait_vla_start_time = 0.0
     clean_hover_remaining = 0.0
-    last_vla_event_id = -1
+    current_req_id = 0
 
-    print(f"\n[Ground Controller] 已啟用【已知缺陷點導航】模式！共有 {len(KNOWN_DEFECTS)} 個髒污點待清。")
-    print(f"[Ground Controller] 高度已設定為: Z = {TARGET_Z} 公尺 (面板上方 1.5m)")
+    print(f"\n[Ground Controller] 已啟用【按需觸發 VLA 推論】模式！共有 {len(KNOWN_DEFECTS)} 個髒污點待清。")
+    print(f"[Ground Controller] 高度已設定為: Z = {TARGET_Z} 公尺 (面板 5.0m + 上方 1.5m)")
     print(f"[Ground Controller] 等待無人機心跳包...")
 
     start_time = prev_time = None
@@ -200,7 +212,7 @@ def main():
                     home_x, home_y = x, y
                     start_time = prev_time = curr_time
                     home_initialized = True
-                    print(f"✅ Home 鎖定: X={home_x:.2f}, Y={home_y:.2f}。準備爬升...")
+                    print(f"✅ Home 鎖定: X={home_x:.2f}, Y={home_y:.2f}。準備爬升至 {TARGET_Z}m...")
 
                 dt = min(max(curr_time - prev_time, DT_MIN), DT_MAX)
                 prev_time = curr_time
@@ -218,7 +230,7 @@ def main():
                         current_target_x = home_x + KNOWN_DEFECTS[wp_index][0]
                         current_target_y = home_y + KNOWN_DEFECTS[wp_index][1]
                         transition_start_time = curr_time
-                        print(f"\n🚀 啟程前往落葉群 1/2: ({current_target_x:.1f}, {current_target_y:.1f})")
+                        print(f"\n🚀 啟程前往髒污區 {wp_index+1}/{len(KNOWN_DEFECTS)}: ({current_target_x:.2f}, {current_target_y:.2f}) [飛行途中不發送影像]")
 
                 elif flight_state == "GO_WAYPOINT":
                     mode = f"Go_WP_{wp_index+1}"
@@ -230,22 +242,25 @@ def main():
                         target_x, target_y = current_target_x, current_target_y
                         flight_state = "WAIT_VLA"
                         wait_vla_start_time = curr_time
-                        print(f"\n📍 已抵達髒污區 {wp_index+1}，等待 VLA 視覺評估清洗時間...")
+                        
+                        # 抵達髒污點！發出單次拍照與 VLA 推論請求
+                        current_req_id += 1
+                        request_vla_inference(current_req_id, wp_index + 1)
+                        print(f"\n📍 已抵達髒污區 {wp_index+1}！已發送單次拍照請求 (req_id={current_req_id})，等待 SmolVLA 推論...")
 
                 elif flight_state == "WAIT_VLA":
                     mode = "Wait_VLA"
                     target_x, target_y = current_target_x, current_target_y
                     
-                    vla_cmd = read_vla_cleaning_duration(last_vla_event_id)
+                    vla_cmd = read_vla_cleaning_duration(current_req_id)
                     if vla_cmd is not None:
-                        last_vla_event_id = vla_cmd["event_id"]
                         clean_hover_remaining = float(vla_cmd["hover_duration"])
                         flight_state = "CLEAN_HOVER"
-                        print(f"🧽 [VLA 回報] 髒污指標 {vla_cmd.get('dirt_score', 0.0)*100:.0f}%，開始定點清洗 {clean_hover_remaining:.1f} 秒！")
-                    elif (curr_time - wait_vla_start_time) > 4.0: 
+                        print(f"🧽 [收到 SmolVLA 單次推論回報] 髒污指標 {vla_cmd.get('dirt_score', 0.0)*100:.1f}% ➔ 開始定點清洗 {clean_hover_remaining:.1f} 秒！")
+                    elif (curr_time - wait_vla_start_time) > 5.0:
                         clean_hover_remaining = 6.0
                         flight_state = "CLEAN_HOVER"
-                        print("⚠️ [VLA 等待超時] 啟動預設保底清洗 6.0 秒！")
+                        print("⚠️ [SmolVLA 等待超時] 啟動預設保底清洗 6.0 秒！")
 
                 elif flight_state == "CLEAN_HOVER":
                     mode = f"Clean({clean_hover_remaining:.1f}s)"
@@ -253,7 +268,7 @@ def main():
                     clean_hover_remaining -= dt
                     
                     if clean_hover_remaining <= 0.0:
-                        print(f"✅ 髒污點 {wp_index+1} 清洗完成！")
+                        print(f"✅ 髒污區 {wp_index+1} 清洗完成！")
                         wp_index += 1
                         start_pos_x, start_pos_y = x, y
                         transition_start_time = curr_time
@@ -262,7 +277,7 @@ def main():
                             current_target_x = home_x + KNOWN_DEFECTS[wp_index][0]
                             current_target_y = home_y + KNOWN_DEFECTS[wp_index][1]
                             flight_state = "GO_WAYPOINT"
-                            print(f"\n🚀 繼續前往泥沙區 {wp_index+1}/2: ({current_target_x:.1f}, {current_target_y:.1f})")
+                            print(f"\n🚀 繼續前往髒污區 {wp_index+1}/{len(KNOWN_DEFECTS)}: ({current_target_x:.2f}, {current_target_y:.2f}) [飛行途中不發送影像]")
                         else:
                             flight_state = "RETURN_HOME"
                             print("\n🏁 所有髒污點均已清洗完畢，準備返航...")
@@ -333,7 +348,7 @@ def main():
         sock_recv.close()
         sock_send.close()
         if log_data:
-            fname = f"sequential_log_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+            fname = f"ondemand_vla_log_{time.strftime('%Y%m%d_%H%M%S')}.csv"
             with open(fname, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(['Time', 'X', 'Y', 'Z', 'Tgt_X', 'Tgt_Y', 'Tgt_Z', 'Triggered', 'State'])
