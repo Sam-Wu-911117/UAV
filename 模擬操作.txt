@@ -36,6 +36,10 @@ ros2 run ros_gz_bridge parameter_bridge /world/solar_farm/model/x500_depth_0/lin
 啟動「眼睛」：ROS 2 影像發送端 (終端機 4)
 在系統預設的 Python 3.10 環境中，訂閱 ROS 2 影像並透過 UDP 廣播。
 cd ~/UAV/pi
+source /opt/ros/humble/setup.bash
+unset ROS_LOCALHOST_ONLY
+export ROS_DOMAIN_ID=0
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 python3 ros_vision_sender.py
 
 啟動「大腦」：SmolVLA 接收與推論端 (終端機 5)
