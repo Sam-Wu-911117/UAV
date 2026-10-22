@@ -11,7 +11,7 @@ import os
 import numpy as np
 
 # ==========================================
-# 1. 控制參數設定
+# 1. 控制參數設定 (完全保留原有強健控制增益)
 # ==========================================
 UAV_MASS = 3.5
 HOVER_FORCE = UAV_MASS * 9.81
@@ -44,16 +44,22 @@ ROLL_PITCH_LIMIT = 0.6
 DT_MIN, DT_MAX = 0.01, 0.03
 
 # ==========================================
-# 🎯 任務與路徑參數 (太陽能板 5.0m + 上方 1.5m = 6.5m)
+# 🎯 任務與路徑參數 (太陽能板垂直對準巡檢)
 # ==========================================
-TARGET_Z = 6.5
+TARGET_Z = 6.5                 # 基準巡航高度 (可依太陽能板場域修改)
 LANDING_SPEED = 0.5
 HOVER_BEFORE_TRAJ = 3.0
-TRANSITION_DURATION = 4.0
+TRANSITION_DURATION = 5.0      # 航點間平滑飛行時間 (5 秒)
 
-KNOWN_DEFECTS = [
-    (3.0, 1.10),  # 髒污區 1：第一排面板 (落葉群)
-    (5.5, 2.10)   # 髒污區 2：第二排面板 (大面積泥沙)
+# ☀️ 太陽能板相機垂直對準專屬參數
+SOLAR_ALIGN_DURATION = 2.5     # 根據 VLA 調整位置對準面板的平滑移動時間 (2.5 秒)
+SOLAR_MAX_OFFSET_XY = 1.5      # 單次 XY 軸最大位置修正限制 (公尺，防止異常數值爆衝)
+SOLAR_MIN_Z, SOLAR_MAX_Z = 2.0, 8.0 # 高度調整安全邊界 (公尺)
+SOLAR_HOVER_TIME = 3.0         # 對準後固定懸停拍攝/檢視時間 (3.0 秒)
+
+TARGET_POINTS = [
+    (3.0, 1.10),  # 太陽能板觀測點 1 (粗略座標)
+    (5.5, 2.10)   # 太陽能板觀測點 2 (粗略座標)
 ]
 
 SHM_REQ_TEMP = '/dev/shm/uav_req_tmp.json'
@@ -61,7 +67,7 @@ SHM_REQ_PATH = '/dev/shm/uav_req.json'
 SHM_ACT_PATH = '/dev/shm/uav_action.json'
 
 # ==========================================
-# 2. ETM 控制器
+# 2. ETM 控制器 (完全維持原有增益與歸屬函數架構)
 # ==========================================
 class Altitude_ETM_Controller:
     def __init__(self):
@@ -111,6 +117,7 @@ class Fuzzy_ETM_Core:
         e_ctrl = self.filtered_error.copy()
         if abs(e_ctrl[0]) < POS_DEADZONE_XY: e_ctrl[0] = 0.0
         if abs(e_ctrl[1]) < VEL_DEADZONE_XY: e_ctrl[1] = 0.0
+        # 依據追蹤誤差計算模糊歸屬函數權重 w2
         w2 = float(np.clip(abs(float(e_trk[0])) / POS_ERR_MAX, 0.0, 1.0))
         F_fuzzy = (1.0 - w2) * self.F1 + w2 * self.F2
         alpha = max(min(1.0, float(np.linalg.norm(e_ctrl)) / SOFT_ERR_XY), ALPHA_MIN)
@@ -121,7 +128,7 @@ class Fuzzy_ETM_Core:
         return self.last_control_u, triggered
 
 # ==========================================
-# 3. 輔助函式 (按需觸發拍照與讀取結果)
+# 3. 輔助函式
 # ==========================================
 def min_jerk(t, T, p0, pf):
     t = max(0.0, min(t, T))
@@ -129,11 +136,10 @@ def min_jerk(t, T, p0, pf):
     tau3, tau4, tau5 = tau**3, tau**4, tau**5
     pos = p0 + (pf - p0) * (10*tau3 - 15*tau4 + 6*tau5)
     vel = (pf - p0) / T * (30*tau**2 - 60*tau3 + 30*tau4)
-    acc = (pf - p0) / (T**2) * (60*tau - 180*tau**2 + 120*tau3)
+    acc = (pf - p0) / (T**2) * (60*tau - 180*tau**2 + 30*4*tau3)
     return pos, vel, acc
 
 def request_vla_inference(req_id, wp_index):
-    """當抵達髒污點時，向終端機 2 發出單次拍照與 VLA 推論請求"""
     req_data = {
         "req_id": int(req_id),
         "wp_index": int(wp_index),
@@ -143,14 +149,14 @@ def request_vla_inference(req_id, wp_index):
         json.dump(req_data, f)
     os.replace(SHM_REQ_TEMP, SHM_REQ_PATH)
 
-def read_vla_cleaning_duration(expected_req_id):
-    """只讀取與當前 req_id 完全匹配的 VLA 推論結果"""
+def read_vla_decision(expected_req_id):
+    """讀取 VLA 決策：支援 SOLAR_ALIGN (太陽能板相機垂直對準)"""
     if not os.path.exists(SHM_ACT_PATH):
         return None
     try:
         with open(SHM_ACT_PATH, 'r') as f:
             act = json.load(f)
-        if act.get("action") == "CLEAN_DURATION" and act.get("event_id", -1) == expected_req_id:
+        if act.get("event_id", -1) == expected_req_id and act.get("action") == "SOLAR_ALIGN":
             return act
     except Exception:
         pass
@@ -185,14 +191,17 @@ def main():
     flight_state = "HOVER_HOME"
     wp_index = 0
     current_target_x = current_target_y = 0.0
-    start_pos_x = start_pos_y = 0.0
+    start_pos_x = start_pos_y = start_pos_z = 0.0
     transition_start_time = wait_vla_start_time = 0.0
-    clean_hover_remaining = 0.0
+    hover_remaining = 0.0
     current_req_id = 0
 
-    print(f"\n[Ground Controller] 已啟用【按需觸發 VLA 推論】模式！共有 {len(KNOWN_DEFECTS)} 個髒污點待清。")
-    print(f"[Ground Controller] 高度已設定為: Z = {TARGET_Z} 公尺 (面板 5.0m + 上方 1.5m)")
-    print(f"[Ground Controller] 等待無人機心跳包...")
+    align_target_x = align_target_y = 0.0
+    align_target_z = TARGET_Z
+
+    print(f"\n[Ground Controller] 已啟用【VLA 太陽能板垂直對準巡檢】模式！共有 {len(TARGET_POINTS)} 個觀測點。")
+    print(f"[Ground Controller] 基準巡航高度鎖定: Z = {TARGET_Z} 公尺")
+    print("[Ground Controller] 等待心跳包...")
 
     start_time = prev_time = None
     last_print_time = last_send_time = 0.0
@@ -221,17 +230,19 @@ def main():
                 tgt_vx = tgt_vy = tgt_ax = tgt_ay = 0.0
                 tgt_z = TARGET_Z
 
+                # 1. 爬升與初始懸停
                 if flight_state == "HOVER_HOME":
                     mode = "Hover_Home"
                     target_x, target_y = home_x, home_y
-                    if elapsed > HOVER_BEFORE_TRAJ and len(KNOWN_DEFECTS) > 0:
+                    if elapsed > HOVER_BEFORE_TRAJ and abs(z - TARGET_Z) < 0.35 and len(TARGET_POINTS) > 0:
                         flight_state = "GO_WAYPOINT"
                         start_pos_x, start_pos_y = x, y
-                        current_target_x = home_x + KNOWN_DEFECTS[wp_index][0]
-                        current_target_y = home_y + KNOWN_DEFECTS[wp_index][1]
+                        current_target_x = home_x + TARGET_POINTS[wp_index][0]
+                        current_target_y = home_y + TARGET_POINTS[wp_index][1]
                         transition_start_time = curr_time
-                        print(f"\n🚀 啟程前往髒污區 {wp_index+1}/{len(KNOWN_DEFECTS)}: ({current_target_x:.2f}, {current_target_y:.2f}) [飛行途中不發送影像]")
+                        print(f"\n🚀 啟程前往太陽能板觀測點 {wp_index+1}/{len(TARGET_POINTS)}: ({current_target_x:.2f}, {current_target_y:.2f})")
 
+                # 2. 飛往任務航點
                 elif flight_state == "GO_WAYPOINT":
                     mode = f"Go_WP_{wp_index+1}"
                     t_seg = curr_time - transition_start_time
@@ -240,48 +251,107 @@ def main():
                         target_y, tgt_vy, tgt_ay = min_jerk(t_seg, TRANSITION_DURATION, start_pos_y, current_target_y)
                     else:
                         target_x, target_y = current_target_x, current_target_y
-                        flight_state = "WAIT_VLA"
-                        wait_vla_start_time = curr_time
+                        dist_err = math.hypot(x - current_target_x, y - current_target_y)
+                        vel_xy = math.hypot(vx, vy)
                         
-                        # 抵達髒污點！發出單次拍照與 VLA 推論請求
-                        current_req_id += 1
-                        request_vla_inference(current_req_id, wp_index + 1)
-                        print(f"\n📍 已抵達髒污區 {wp_index+1}！已發送單次拍照請求 (req_id={current_req_id})，等待 SmolVLA 推論...")
+                        if (dist_err < 0.40 and vel_xy < 0.35) or (t_seg > TRANSITION_DURATION + 4.0):
+                            flight_state = "WAIT_VLA"
+                            wait_vla_start_time = curr_time
+                            current_req_id += 1
+                            request_vla_inference(current_req_id, wp_index + 1)
+                            print(f"\n📍 已抵達觀測點上方 {wp_index+1} (誤差:{dist_err:.2f}m)！發送 VLA 視覺對準請求 (req_id={current_req_id})")
 
+                # 3. 等待 VLA 太陽能板對準決策
                 elif flight_state == "WAIT_VLA":
                     mode = "Wait_VLA"
                     target_x, target_y = current_target_x, current_target_y
                     
-                    vla_cmd = read_vla_cleaning_duration(current_req_id)
+                    vla_cmd = read_vla_decision(current_req_id)
                     if vla_cmd is not None:
-                        clean_hover_remaining = float(vla_cmd["hover_duration"])
-                        flight_state = "CLEAN_HOVER"
-                        print(f"🧽 [收到 SmolVLA 單次推論回報] 髒污指標 {vla_cmd.get('dirt_score', 0.0)*100:.1f}% ➔ 開始定點清洗 {clean_hover_remaining:.1f} 秒！")
-                    elif (curr_time - wait_vla_start_time) > 5.0:
-                        clean_hover_remaining = 6.0
-                        flight_state = "CLEAN_HOVER"
-                        print("⚠️ [SmolVLA 等待超時] 啟動預設保底清洗 6.0 秒！")
-
-                elif flight_state == "CLEAN_HOVER":
-                    mode = f"Clean({clean_hover_remaining:.1f}s)"
-                    target_x, target_y = current_target_x, current_target_y
-                    clean_hover_remaining -= dt
-                    
-                    if clean_hover_remaining <= 0.0:
-                        print(f"✅ 髒污區 {wp_index+1} 清洗完成！")
-                        wp_index += 1
-                        start_pos_x, start_pos_y = x, y
-                        transition_start_time = curr_time
+                        # 接收 VLA 計算之機體座標系修正量 (單位: 公尺)
+                        # offset_x: 機頭前後方向修正 (+為往前飛, -為往後退)
+                        # offset_y: 機身左右方向修正 (+為往左移, -為往右移)
+                        # offset_z: 垂直高度修正 (+為往上爬升, -為往下降低)
+                        dx_body = float(np.clip(float(vla_cmd.get("offset_x", 0.0)), -SOLAR_MAX_OFFSET_XY, SOLAR_MAX_OFFSET_XY))
+                        dy_body = float(np.clip(float(vla_cmd.get("offset_y", 0.0)), -SOLAR_MAX_OFFSET_XY, SOLAR_MAX_OFFSET_XY))
+                        dz_body = float(vla_cmd.get("offset_z", 0.0))
                         
-                        if wp_index < len(KNOWN_DEFECTS):
-                            current_target_x = home_x + KNOWN_DEFECTS[wp_index][0]
-                            current_target_y = home_y + KNOWN_DEFECTS[wp_index][1]
-                            flight_state = "GO_WAYPOINT"
-                            print(f"\n🚀 繼續前往髒污區 {wp_index+1}/{len(KNOWN_DEFECTS)}: ({current_target_x:.2f}, {current_target_y:.2f}) [飛行途中不發送影像]")
-                        else:
-                            flight_state = "RETURN_HOME"
-                            print("\n🏁 所有髒污點均已清洗完畢，準備返航...")
+                        # 將機體座標修正量透過當前偏航角 (yaw) 轉換至世界座標系
+                        align_target_x = x + (dx_body * math.cos(yaw) - dy_body * math.sin(yaw))
+                        align_target_y = y + (dx_body * math.sin(yaw) + dy_body * math.cos(yaw))
+                        align_target_z = float(np.clip(TARGET_Z + dz_body, SOLAR_MIN_Z, SOLAR_MAX_Z))
+                        hover_remaining = float(vla_cmd.get("hover_time", SOLAR_HOVER_TIME))
+                        
+                        start_pos_x, start_pos_y, start_pos_z = x, y, z
+                        transition_start_time = curr_time
+                        flight_state = "SOLAR_ALIGN_MOVE"
+                        print(f"☀️ [VLA 對準觸發] 機體修正 (dx={dx_body:+.2f}m, dy={dy_body:+.2f}m, dz={dz_body:+.2f}m) "
+                              f"➔ 移至正上方 ({align_target_x:.2f}, {align_target_y:.2f}, Z={align_target_z:.2f})")
 
+                    elif (curr_time - wait_vla_start_time) > 4.0:
+                        # 若 VLA 逾時未回傳，維持當前位置與基準高度直接進行拍攝巡檢
+                        align_target_x, align_target_y = current_target_x, current_target_y
+                        align_target_z = TARGET_Z
+                        hover_remaining = SOLAR_HOVER_TIME
+                        start_pos_x, start_pos_y, start_pos_z = x, y, z
+                        transition_start_time = curr_time
+                        flight_state = "SOLAR_ALIGN_MOVE"
+                        print(f"⚠️ [VLA 回報逾時] 維持當前座標 ({align_target_x:.2f}, {align_target_y:.2f}, Z={align_target_z:.2f}) 懸停 {hover_remaining:.1f} 秒！")
+
+                # ==========================================
+                # ☀️ 太陽能板垂直對準三階段子狀態機
+                # ==========================================
+                # 階段 1：三軸同步平滑移動，讓相機正對太陽能板中心
+                elif flight_state == "SOLAR_ALIGN_MOVE":
+                    mode = "Solar_Align"
+                    t_seg = curr_time - transition_start_time
+                    if t_seg < SOLAR_ALIGN_DURATION:
+                        target_x, tgt_vx, tgt_ax = min_jerk(t_seg, SOLAR_ALIGN_DURATION, start_pos_x, align_target_x)
+                        target_y, tgt_vy, tgt_ay = min_jerk(t_seg, SOLAR_ALIGN_DURATION, start_pos_y, align_target_y)
+                        tgt_z, _, _ = min_jerk(t_seg, SOLAR_ALIGN_DURATION, start_pos_z, align_target_z)
+                    else:
+                        target_x, target_y, tgt_z = align_target_x, align_target_y, align_target_z
+                        dist_err = math.hypot(x - align_target_x, y - align_target_y)
+                        z_err = abs(z - align_target_z)
+                        if (dist_err < 0.25 and z_err < 0.25) or (t_seg > SOLAR_ALIGN_DURATION + 2.0):
+                            flight_state = "SOLAR_HOVER_INSPECT"
+                            print(f"📸 相機已垂直對準太陽能板 (XY誤差:{dist_err:.2f}m, Z={z:.2f}m)，穩定懸停 {hover_remaining:.1f} 秒進行巡檢！")
+
+                # 階段 2：定點穩定懸停巡檢 (此時機身 Roll/Pitch 趨近 0 度，確保相機畫面垂直朝下)
+                elif flight_state == "SOLAR_HOVER_INSPECT":
+                    mode = f"Solar({hover_remaining:.1f}s)"
+                    target_x, target_y = align_target_x, align_target_y
+                    tgt_z = align_target_z
+                    hover_remaining -= dt
+                    if hover_remaining <= 0.0:
+                        flight_state = "SOLAR_ASCEND_Z"
+                        start_pos_z = z
+                        transition_start_time = curr_time
+                        print("✅ 太陽能板巡檢完成！準備恢復基準巡航高度...")
+
+                # 階段 3：恢復基準高度並前往下一處太陽能板
+                elif flight_state == "SOLAR_ASCEND_Z":
+                    mode = "Solar_Asc"
+                    target_x, target_y = align_target_x, align_target_y
+                    t_seg = curr_time - transition_start_time
+                    if t_seg < SOLAR_ALIGN_DURATION:
+                        tgt_z, _, _ = min_jerk(t_seg, SOLAR_ALIGN_DURATION, start_pos_z, TARGET_Z)
+                    else:
+                        tgt_z = TARGET_Z
+                        if abs(z - TARGET_Z) < 0.35 or (t_seg > SOLAR_ALIGN_DURATION + 2.0):
+                            wp_index += 1
+                            start_pos_x, start_pos_y = x, y
+                            transition_start_time = curr_time
+                            if wp_index < len(TARGET_POINTS):
+                                current_target_x = home_x + TARGET_POINTS[wp_index][0]
+                                current_target_y = home_y + TARGET_POINTS[wp_index][1]
+                                flight_state = "GO_WAYPOINT"
+                                print(f"\n🚀 已恢復基準高度，前往下一太陽能板觀測點 {wp_index+1}/{len(TARGET_POINTS)}: ({current_target_x:.2f}, {current_target_y:.2f})")
+                            else:
+                                flight_state = "RETURN_HOME"
+                                print("\n🏁 所有太陽能板均已巡檢完畢，啟動返航程序！")
+
+                # 4. 返航回 Home 點
                 elif flight_state == "RETURN_HOME":
                     mode = "Return_Home"
                     t_seg = curr_time - transition_start_time
@@ -290,16 +360,20 @@ def main():
                         target_y, tgt_vy, tgt_ay = min_jerk(t_seg, TRANSITION_DURATION, start_pos_y, home_y)
                     else:
                         target_x, target_y = home_x, home_y
-                        flight_state = "LAND"
-                        transition_start_time = curr_time
-                        print("\n🛬 抵達起飛點，啟動平滑降落程序...")
+                        dist_home = math.hypot(x - home_x, y - home_y)
+                        if dist_home < 0.40 or (t_seg > TRANSITION_DURATION + 3.0):
+                            flight_state = "LAND"
+                            transition_start_time = curr_time
+                            print("\n🛬 已安全返航至起飛點正上方，開始垂直平穩降落...")
 
+                # 5. 降落
                 elif flight_state == "LAND":
                     mode = "Land"
                     target_x, target_y = home_x, home_y
                     t_land = curr_time - transition_start_time
                     tgt_z = max(0.0, TARGET_Z - LANDING_SPEED * t_land)
 
+                # 控制量計算 (完全保留原有增益與歸屬函數架構)
                 u_accel, trig_z = alt_ctrl.update(np.array([z, vz], dtype=float), tgt_z, dt)
                 thrust_cmd = float(np.clip((HOVER_THRUST + u_accel * THRUST_SCALE) / max(math.cos(last_cmd_roll) * math.cos(last_cmd_pitch), 0.5), THR_MIN, THR_MAX))
 
@@ -334,8 +408,8 @@ def main():
                     print(f"[{mode:12}] T:{elapsed:5.1f}s | XYZ({x:+4.1f},{y:+4.1f},{z:+4.1f}) | "
                           f"CMD R/P({math.degrees(target_roll):+4.0f}°,{math.degrees(target_pitch):+4.0f}°) | {trig_str}")
 
-                if flight_state == "LAND" and tgt_z <= 0.0 and z < 0.2:
-                    print("\n[Ground Controller] 降落完成，馬達鎖定！")
+                if flight_state == "LAND" and tgt_z <= 0.0 and z < 0.25:
+                    print("\n[Ground Controller] 已落地，馬達全數鎖定！")
                     stop_msg = struct.pack("<4fd", 0.0, 0.0, 0.0, 0.0, time.time())
                     for _ in range(10):
                         sock_send.sendto(stop_msg, (PI_IP, UDP_SEND_PORT))
@@ -343,17 +417,17 @@ def main():
                     break
 
     except KeyboardInterrupt:
-        print("\n[Ground Controller] 使用者中斷")
+        print("\n[Ground Controller] 使用者中斷任務")
     finally:
         sock_recv.close()
         sock_send.close()
         if log_data:
-            fname = f"ondemand_vla_log_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+            fname = f"solar_flight_log_{time.strftime('%Y%m%d_%H%M%S')}.csv"
             with open(fname, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(['Time', 'X', 'Y', 'Z', 'Tgt_X', 'Tgt_Y', 'Tgt_Z', 'Triggered', 'State'])
                 writer.writerows(log_data)
-            print(f"[Ground Controller] 飛行紀錄已儲存至 {fname}")
+            print(f"[Ground Controller] 紀錄已存至 {fname}")
 
 if __name__ == "__main__":
     main()
