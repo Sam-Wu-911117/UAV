@@ -44,23 +44,28 @@ ROLL_PITCH_LIMIT = 0.6
 DT_MIN, DT_MAX = 0.01, 0.03
 
 # ==========================================
-# 🎯 任務與路徑參數 (太陽能板垂直對準巡檢)
+# 🎯 任務與路徑參數 (單排樹列單側外擺圓弧巡檢)
 # ==========================================
-TARGET_Z = 6.5                 # 基準巡航高度 (可依太陽能板場域修改)
+TARGET_Z = 2.5                 # 基準巡檢高度 (公尺)
+Z_VARIATION_AMP = 0.4          # 繞弧過程中的垂直高度微幅起伏 (公尺，獲取高低視角)
 LANDING_SPEED = 0.5
 HOVER_BEFORE_TRAJ = 3.0
-TRANSITION_DURATION = 5.0      # 航點間平滑飛行時間 (5 秒)
+TRANSITION_DURATION = 4.0      # 樹間直線過渡時間 (秒)
 
-# ☀️ 太陽能板相機垂直對準專屬參數
-SOLAR_ALIGN_DURATION = 2.5     # 根據 VLA 調整位置對準面板的平滑移動時間 (2.5 秒)
-SOLAR_MAX_OFFSET_XY = 1.5      # 單次 XY 軸最大位置修正限制 (公尺，防止異常數值爆衝)
-SOLAR_MIN_Z, SOLAR_MAX_Z = 2.0, 8.0 # 高度調整安全邊界 (公尺)
-SOLAR_HOVER_TIME = 3.0         # 對準後固定懸停拍攝/檢視時間 (3.0 秒)
-
-TARGET_POINTS = [
-    (3.0, 1.10),  # 太陽能板觀測點 1 (粗略座標)
-    (5.5, 2.10)   # 太陽能板觀測點 2 (粗略座標)
+# 🌲 單排樹列定義 (樹列位於 Y=0 線上，無人機恆在 Y > 0 單側飛行)
+# 格式: (樹木中心 X, 樹木中心 Y)
+TREES = [
+    (3.5, 0.0),   # 第 1 棵樹
+    (7.5, 0.0),   # 第 2 棵樹
+    (11.5, 0.0)   # 第 3 棵樹
 ]
+
+# 弧線幾何參數
+DEFAULT_ARC_RADIUS = 2.4       # 預設繞弧半徑 (公尺)
+MIN_SAFE_Y = 1.2               # 單側防碰撞最小距離邊界 (公尺，保證永不穿越樹列)
+ARC_DURATION = 6.0             # 繞單棵樹單側圓弧的巡航時間 (秒)
+ARC_THETA_START = math.radians(35.0)   # 入弧角 (約 35 度，前斜視角)
+ARC_THETA_END = math.radians(145.0)    # 出弧角 (約 145 度，後斜視角)
 
 SHM_REQ_TEMP = '/dev/shm/uav_req_tmp.json'
 SHM_REQ_PATH = '/dev/shm/uav_req.json'
@@ -128,7 +133,7 @@ class Fuzzy_ETM_Core:
         return self.last_control_u, triggered
 
 # ==========================================
-# 3. 輔助函式
+# 3. 軌跡幾何計算函式
 # ==========================================
 def min_jerk(t, T, p0, pf):
     t = max(0.0, min(t, T))
@@ -136,13 +141,48 @@ def min_jerk(t, T, p0, pf):
     tau3, tau4, tau5 = tau**3, tau**4, tau**5
     pos = p0 + (pf - p0) * (10*tau3 - 15*tau4 + 6*tau5)
     vel = (pf - p0) / T * (30*tau**2 - 60*tau3 + 30*tau4)
-    acc = (pf - p0) / (T**2) * (60*tau - 180*tau**2 + 30*4*tau3)
+    acc = (pf - p0) / (T**2) * (60*tau - 180*tau**2 + 120*tau3)
     return pos, vel, acc
 
-def request_vla_inference(req_id, wp_index):
+def calculate_tree_arc(tree_x, tree_y, radius, t_seg, T_total, z_base):
+    """
+    計算圍繞單棵樹單側的凸外擺圓弧 (X 方向單向朝前前進，Y 軸恆維持在單側正值)
+    """
+    t_clamped = max(0.0, min(t_seg, T_total))
+    theta, dtheta, ddtheta = min_jerk(t_clamped, T_total, ARC_THETA_START, ARC_THETA_END)
+
+    # 圓弧軌跡幾何 (半徑 R 沿著單側外擺)
+    # x = tree_x - R * cos(theta), y = tree_y + R * sin(theta)
+    x = tree_x - radius * math.cos(theta)
+    y = max(tree_y + radius * math.sin(theta), MIN_SAFE_Y)
+
+    # 速度前饋 (連鎖律)
+    vx = radius * math.sin(theta) * dtheta
+    vy = radius * math.cos(theta) * dtheta
+
+    # 加速度前饋
+    ax = radius * (math.cos(theta) * (dtheta**2) + math.sin(theta) * ddtheta)
+    ay = radius * (-math.sin(theta) * (dtheta**2) + math.cos(theta) * ddtheta)
+
+    # 高度微幅升降正弦波 (增加俯仰多角度取樣)
+    tau = t_clamped / T_total
+    z = z_base + Z_VARIATION_AMP * math.sin(2.0 * math.pi * tau)
+    vz = Z_VARIATION_AMP * (2.0 * math.pi / T_total) * math.cos(2.0 * math.pi * tau)
+    az = -Z_VARIATION_AMP * ((2.0 * math.pi / T_total)**2) * math.sin(2.0 * math.pi * tau)
+
+    return x, y, z, vx, vy, vz, ax, ay, az
+
+def get_arc_start_point(tree_x, tree_y, radius):
+    """計算進入圓弧的起點座標 (前斜視角起點)"""
+    x = tree_x - radius * math.cos(ARC_THETA_START)
+    y = max(tree_y + radius * math.sin(ARC_THETA_START), MIN_SAFE_Y)
+    return x, y
+
+def request_vla_inference(req_id, tree_index):
     req_data = {
         "req_id": int(req_id),
-        "wp_index": int(wp_index),
+        "tree_index": int(tree_index),
+        "task": "ALIGN_TREE_SINGLE_SIDE",
         "timestamp": time.time()
     }
     with open(SHM_REQ_TEMP, 'w') as f:
@@ -150,13 +190,13 @@ def request_vla_inference(req_id, wp_index):
     os.replace(SHM_REQ_TEMP, SHM_REQ_PATH)
 
 def read_vla_decision(expected_req_id):
-    """讀取 VLA 決策：支援 SOLAR_ALIGN (太陽能板相機垂直對準)"""
+    """讀取 VLA 決策：微調單側圓弧半徑與觀測高度"""
     if not os.path.exists(SHM_ACT_PATH):
         return None
     try:
         with open(SHM_ACT_PATH, 'r') as f:
             act = json.load(f)
-        if act.get("event_id", -1) == expected_req_id and act.get("action") == "SOLAR_ALIGN":
+        if act.get("event_id", -1) == expected_req_id and act.get("action") == "TREE_ARC_ALIGN":
             return act
     except Exception:
         pass
@@ -189,18 +229,17 @@ def main():
     last_cmd_roll, last_cmd_pitch = 0.0, 0.0
 
     flight_state = "HOVER_HOME"
-    wp_index = 0
+    tree_idx = 0
     current_target_x = current_target_y = 0.0
     start_pos_x = start_pos_y = start_pos_z = 0.0
     transition_start_time = wait_vla_start_time = 0.0
-    hover_remaining = 0.0
     current_req_id = 0
 
-    align_target_x = align_target_y = 0.0
-    align_target_z = TARGET_Z
+    active_radius = DEFAULT_ARC_RADIUS
+    active_tree_z = TARGET_Z
 
-    print(f"\n[Ground Controller] 已啟用【VLA 太陽能板垂直對準巡檢】模式！共有 {len(TARGET_POINTS)} 個觀測點。")
-    print(f"[Ground Controller] 基準巡航高度鎖定: Z = {TARGET_Z} 公尺")
+    print(f"\n[Ground Controller] 已啟用【單排樹列單側外擺圓弧巡檢】模式！共 {len(TREES)} 棵樹。")
+    print(f"[Ground Controller] 固定相機配置：透過單向外擺圓弧獲得 前斜 ➔ 正側 ➔ 後斜 多角度觀測。")
     print("[Ground Controller] 等待心跳包...")
 
     start_time = prev_time = None
@@ -230,21 +269,27 @@ def main():
                 tgt_vx = tgt_vy = tgt_ax = tgt_ay = 0.0
                 tgt_z = TARGET_Z
 
+                # --------------------------------------------------
                 # 1. 爬升與初始懸停
+                # --------------------------------------------------
                 if flight_state == "HOVER_HOME":
                     mode = "Hover_Home"
                     target_x, target_y = home_x, home_y
-                    if elapsed > HOVER_BEFORE_TRAJ and abs(z - TARGET_Z) < 0.35 and len(TARGET_POINTS) > 0:
-                        flight_state = "GO_WAYPOINT"
+                    if elapsed > HOVER_BEFORE_TRAJ and abs(z - TARGET_Z) < 0.35 and len(TREES) > 0:
+                        flight_state = "APPROACH_ARC_ENTRY"
                         start_pos_x, start_pos_y = x, y
-                        current_target_x = home_x + TARGET_POINTS[wp_index][0]
-                        current_target_y = home_y + TARGET_POINTS[wp_index][1]
+                        # 計算第 1 棵樹的入弧起點
+                        tx, ty = TREES[tree_idx]
+                        entry_x, entry_y = get_arc_start_point(home_x + tx, home_y + ty, DEFAULT_ARC_RADIUS)
+                        current_target_x, current_target_y = entry_x, entry_y
                         transition_start_time = curr_time
-                        print(f"\n🚀 啟程前往太陽能板觀測點 {wp_index+1}/{len(TARGET_POINTS)}: ({current_target_x:.2f}, {current_target_y:.2f})")
+                        print(f"\n🚀 啟程前往樹木 {tree_idx+1}/{len(TREES)} 入弧點: ({current_target_x:.2f}, {current_target_y:.2f})")
 
-                # 2. 飛往任務航點
-                elif flight_state == "GO_WAYPOINT":
-                    mode = f"Go_WP_{wp_index+1}"
+                # --------------------------------------------------
+                # 2. 飛往外擺圓弧切入點 (單向平滑前進)
+                # --------------------------------------------------
+                elif flight_state == "APPROACH_ARC_ENTRY":
+                    mode = f"Appr_T{tree_idx+1}"
                     t_seg = curr_time - transition_start_time
                     if t_seg < TRANSITION_DURATION:
                         target_x, tgt_vx, tgt_ax = min_jerk(t_seg, TRANSITION_DURATION, start_pos_x, current_target_x)
@@ -254,126 +299,109 @@ def main():
                         dist_err = math.hypot(x - current_target_x, y - current_target_y)
                         vel_xy = math.hypot(vx, vy)
                         
-                        if (dist_err < 0.40 and vel_xy < 0.35) or (t_seg > TRANSITION_DURATION + 4.0):
-                            flight_state = "WAIT_VLA"
+                        if (dist_err < 0.35 and vel_xy < 0.30) or (t_seg > TRANSITION_DURATION + 3.0):
+                            flight_state = "WAIT_VLA_ARC"
                             wait_vla_start_time = curr_time
                             current_req_id += 1
-                            request_vla_inference(current_req_id, wp_index + 1)
-                            print(f"\n📍 已抵達觀測點上方 {wp_index+1} (誤差:{dist_err:.2f}m)！發送 VLA 視覺對準請求 (req_id={current_req_id})")
+                            request_vla_inference(current_req_id, tree_idx + 1)
+                            print(f"\n📍 已抵達樹木 {tree_idx+1} 入弧前哨點！發送 VLA 幾何參數推論 (req_id={current_req_id})")
 
-                # 3. 等待 VLA 太陽能板對準決策
-                elif flight_state == "WAIT_VLA":
+                # --------------------------------------------------
+                # 3. 等待 VLA 微調圓弧半徑與相機對準參數
+                # --------------------------------------------------
+                elif flight_state == "WAIT_VLA_ARC":
                     mode = "Wait_VLA"
                     target_x, target_y = current_target_x, current_target_y
                     
                     vla_cmd = read_vla_decision(current_req_id)
+                    vla_ready = False
+
                     if vla_cmd is not None:
-                        # 接收 VLA 計算之機體座標系修正量 (單位: 公尺)
-                        # offset_x: 機頭前後方向修正 (+為往前飛, -為往後退)
-                        # offset_y: 機身左右方向修正 (+為往左移, -為往右移)
-                        # offset_z: 垂直高度修正 (+為往上爬升, -為往下降低)
-                        dx_body = float(np.clip(float(vla_cmd.get("offset_x", 0.0)), -SOLAR_MAX_OFFSET_XY, SOLAR_MAX_OFFSET_XY))
-                        dy_body = float(np.clip(float(vla_cmd.get("offset_y", 0.0)), -SOLAR_MAX_OFFSET_XY, SOLAR_MAX_OFFSET_XY))
-                        dz_body = float(vla_cmd.get("offset_z", 0.0))
-                        
-                        # 將機體座標修正量透過當前偏航角 (yaw) 轉換至世界座標系
-                        align_target_x = x + (dx_body * math.cos(yaw) - dy_body * math.sin(yaw))
-                        align_target_y = y + (dx_body * math.sin(yaw) + dy_body * math.cos(yaw))
-                        align_target_z = float(np.clip(TARGET_Z + dz_body, SOLAR_MIN_Z, SOLAR_MAX_Z))
-                        hover_remaining = float(vla_cmd.get("hover_time", SOLAR_HOVER_TIME))
-                        
+                        # VLA 根據畫面微調圓弧半徑 (delta_radius) 與觀測高度 (delta_z)
+                        delta_r = float(vla_cmd.get("delta_radius", 0.0))
+                        delta_z = float(vla_cmd.get("delta_z", 0.0))
+                        active_radius = float(np.clip(DEFAULT_ARC_RADIUS + delta_r, 1.8, 3.5))
+                        active_tree_z = float(np.clip(TARGET_Z + delta_z, 1.5, 4.5))
+                        vla_ready = True
+                        print(f"🌲 [VLA 幾何確定] 半徑調整至 R={active_radius:.2f}m, 基準高度 Z={active_tree_z:.2f}m")
+
+                    elif (curr_time - wait_vla_start_time) > 2.0:
+                        # 逾時預設值
+                        active_radius = DEFAULT_ARC_RADIUS
+                        active_tree_z = TARGET_Z
+                        vla_ready = True
+                        print(f"⚠️ [VLA 回報逾時] 使用預設外擺半徑 R={active_radius:.2f}m, Z={active_tree_z:.2f}m")
+
+                    if vla_ready:
+                        flight_state = "EXECUTE_TREE_ARC"
+                        transition_start_time = curr_time
+                        print(f"🔄 開始執行單側外擺圓弧巡航 (單向朝 +X 前進，取得前斜/正側/後斜多視角)...")
+
+                # --------------------------------------------------
+                # 4. 執行單側凸外擺圓弧 (朝同方向移動 + 繞圓弧多角度取樣)
+                # --------------------------------------------------
+                elif flight_state == "EXECUTE_TREE_ARC":
+                    t_seg = curr_time - transition_start_time
+                    tx, ty = TREES[tree_idx]
+                    center_x, center_y = home_x + tx, home_y + ty
+
+                    target_x, target_y, tgt_z, tgt_vx, tgt_vy, tgt_z_vel, tgt_ax, tgt_ay, tgt_z_acc = calculate_tree_arc(
+                        center_x, center_y, active_radius, t_seg, ARC_DURATION, active_tree_z
+                    )
+
+                    # 當前視角辨識 (前斜、正側、後斜)
+                    tau = min(1.0, t_seg / ARC_DURATION)
+                    if tau < 0.35:
+                        mode = f"Arc_FrontOblique"
+                    elif tau < 0.65:
+                        mode = f"Arc_SideOrth"
+                    else:
+                        mode = f"Arc_RearOblique"
+
+                    if t_seg >= ARC_DURATION:
+                        tree_idx += 1
                         start_pos_x, start_pos_y, start_pos_z = x, y, z
                         transition_start_time = curr_time
-                        flight_state = "SOLAR_ALIGN_MOVE"
-                        print(f"☀️ [VLA 對準觸發] 機體修正 (dx={dx_body:+.2f}m, dy={dy_body:+.2f}m, dz={dz_body:+.2f}m) "
-                              f"➔ 移至正上方 ({align_target_x:.2f}, {align_target_y:.2f}, Z={align_target_z:.2f})")
 
-                    elif (curr_time - wait_vla_start_time) > 4.0:
-                        # 若 VLA 逾時未回傳，維持當前位置與基準高度直接進行拍攝巡檢
-                        align_target_x, align_target_y = current_target_x, current_target_y
-                        align_target_z = TARGET_Z
-                        hover_remaining = SOLAR_HOVER_TIME
-                        start_pos_x, start_pos_y, start_pos_z = x, y, z
-                        transition_start_time = curr_time
-                        flight_state = "SOLAR_ALIGN_MOVE"
-                        print(f"⚠️ [VLA 回報逾時] 維持當前座標 ({align_target_x:.2f}, {align_target_y:.2f}, Z={align_target_z:.2f}) 懸停 {hover_remaining:.1f} 秒！")
+                        if tree_idx < len(TREES):
+                            # 前往下一個樹木的入弧起點 (載具持續朝 +X 前進，不回頭)
+                            next_tx, next_ty = TREES[tree_idx]
+                            current_target_x, current_target_y = get_arc_start_point(home_x + next_tx, home_y + next_ty, DEFAULT_ARC_RADIUS)
+                            flight_state = "APPROACH_ARC_ENTRY"
+                            print(f"\n✅ 樹木 {tree_idx} 單側多角度觀測完成！直飛下一棵樹入弧點: ({current_target_x:.2f}, {current_target_y:.2f})")
+                        else:
+                            flight_state = "RETURN_HOME"
+                            print("\n🏁 整排樹列單側巡檢完成，啟動返航程序！")
 
-                # ==========================================
-                # ☀️ 太陽能板垂直對準三階段子狀態機
-                # ==========================================
-                # 階段 1：三軸同步平滑移動，讓相機正對太陽能板中心
-                elif flight_state == "SOLAR_ALIGN_MOVE":
-                    mode = "Solar_Align"
-                    t_seg = curr_time - transition_start_time
-                    if t_seg < SOLAR_ALIGN_DURATION:
-                        target_x, tgt_vx, tgt_ax = min_jerk(t_seg, SOLAR_ALIGN_DURATION, start_pos_x, align_target_x)
-                        target_y, tgt_vy, tgt_ay = min_jerk(t_seg, SOLAR_ALIGN_DURATION, start_pos_y, align_target_y)
-                        tgt_z, _, _ = min_jerk(t_seg, SOLAR_ALIGN_DURATION, start_pos_z, align_target_z)
-                    else:
-                        target_x, target_y, tgt_z = align_target_x, align_target_y, align_target_z
-                        dist_err = math.hypot(x - align_target_x, y - align_target_y)
-                        z_err = abs(z - align_target_z)
-                        if (dist_err < 0.25 and z_err < 0.25) or (t_seg > SOLAR_ALIGN_DURATION + 2.0):
-                            flight_state = "SOLAR_HOVER_INSPECT"
-                            print(f"📸 相機已垂直對準太陽能板 (XY誤差:{dist_err:.2f}m, Z={z:.2f}m)，穩定懸停 {hover_remaining:.1f} 秒進行巡檢！")
-
-                # 階段 2：定點穩定懸停巡檢 (此時機身 Roll/Pitch 趨近 0 度，確保相機畫面垂直朝下)
-                elif flight_state == "SOLAR_HOVER_INSPECT":
-                    mode = f"Solar({hover_remaining:.1f}s)"
-                    target_x, target_y = align_target_x, align_target_y
-                    tgt_z = align_target_z
-                    hover_remaining -= dt
-                    if hover_remaining <= 0.0:
-                        flight_state = "SOLAR_ASCEND_Z"
-                        start_pos_z = z
-                        transition_start_time = curr_time
-                        print("✅ 太陽能板巡檢完成！準備恢復基準巡航高度...")
-
-                # 階段 3：恢復基準高度並前往下一處太陽能板
-                elif flight_state == "SOLAR_ASCEND_Z":
-                    mode = "Solar_Asc"
-                    target_x, target_y = align_target_x, align_target_y
-                    t_seg = curr_time - transition_start_time
-                    if t_seg < SOLAR_ALIGN_DURATION:
-                        tgt_z, _, _ = min_jerk(t_seg, SOLAR_ALIGN_DURATION, start_pos_z, TARGET_Z)
-                    else:
-                        tgt_z = TARGET_Z
-                        if abs(z - TARGET_Z) < 0.35 or (t_seg > SOLAR_ALIGN_DURATION + 2.0):
-                            wp_index += 1
-                            start_pos_x, start_pos_y = x, y
-                            transition_start_time = curr_time
-                            if wp_index < len(TARGET_POINTS):
-                                current_target_x = home_x + TARGET_POINTS[wp_index][0]
-                                current_target_y = home_y + TARGET_POINTS[wp_index][1]
-                                flight_state = "GO_WAYPOINT"
-                                print(f"\n🚀 已恢復基準高度，前往下一太陽能板觀測點 {wp_index+1}/{len(TARGET_POINTS)}: ({current_target_x:.2f}, {current_target_y:.2f})")
-                            else:
-                                flight_state = "RETURN_HOME"
-                                print("\n🏁 所有太陽能板均已巡檢完畢，啟動返航程序！")
-
-                # 4. 返航回 Home 點
+                # --------------------------------------------------
+                # 5. 返航程序
+                # --------------------------------------------------
                 elif flight_state == "RETURN_HOME":
                     mode = "Return_Home"
                     t_seg = curr_time - transition_start_time
-                    if t_seg < TRANSITION_DURATION:
-                        target_x, tgt_vx, tgt_ax = min_jerk(t_seg, TRANSITION_DURATION, start_pos_x, home_x)
-                        target_y, tgt_vy, tgt_ay = min_jerk(t_seg, TRANSITION_DURATION, start_pos_y, home_y)
+                    if t_seg < TRANSITION_DURATION + 2.0:
+                        target_x, tgt_vx, tgt_ax = min_jerk(t_seg, TRANSITION_DURATION + 2.0, start_pos_x, home_x)
+                        target_y, tgt_vy, tgt_ay = min_jerk(t_seg, TRANSITION_DURATION + 2.0, start_pos_y, home_y)
                     else:
                         target_x, target_y = home_x, home_y
                         dist_home = math.hypot(x - home_x, y - home_y)
-                        if dist_home < 0.40 or (t_seg > TRANSITION_DURATION + 3.0):
+                        if dist_home < 0.40 or (t_seg > TRANSITION_DURATION + 5.0):
                             flight_state = "LAND"
                             transition_start_time = curr_time
-                            print("\n🛬 已安全返航至起飛點正上方，開始垂直平穩降落...")
+                            print("\n🛬 已抵達起飛點正上方，開始垂直降落...")
 
-                # 5. 降落
+                # --------------------------------------------------
+                # 6. 垂直降落
+                # --------------------------------------------------
                 elif flight_state == "LAND":
                     mode = "Land"
                     target_x, target_y = home_x, home_y
                     t_land = curr_time - transition_start_time
                     tgt_z = max(0.0, TARGET_Z - LANDING_SPEED * t_land)
 
+                # ==========================================
                 # 控制量計算 (完全保留原有增益與歸屬函數架構)
+                # ==========================================
                 u_accel, trig_z = alt_ctrl.update(np.array([z, vz], dtype=float), tgt_z, dt)
                 thrust_cmd = float(np.clip((HOVER_THRUST + u_accel * THRUST_SCALE) / max(math.cos(last_cmd_roll) * math.cos(last_cmd_pitch), 0.5), THR_MIN, THR_MAX))
 
@@ -381,6 +409,7 @@ def main():
                 err_w_x, err_w_y = x - target_x, y - target_y
                 err_w_vx, err_w_vy = vx - tgt_vx, vy - tgt_vy
 
+                # 機體座標誤差轉換
                 err_b_x = err_w_x * cos_y + err_w_y * sin_y
                 err_b_y = -err_w_x * sin_y + err_w_y * cos_y
                 err_b_vx = err_w_vx * cos_y + err_w_vy * sin_y
@@ -388,6 +417,7 @@ def main():
                 ff_b_ax = tgt_ax * cos_y + tgt_ay * sin_y
                 ff_b_ay = -tgt_ax * sin_y + tgt_ay * cos_y
                 
+                # 區間二型模糊 ETM 核心計算
                 u_pitch, trig_x = etm_pos_x.update(np.array([err_b_x, err_b_vx], dtype=float), 0.0, dt, curr_time)
                 u_roll, trig_y = etm_pos_y.update(np.array([err_b_y, err_b_vy], dtype=float), 0.0, dt, curr_time)
 
@@ -405,7 +435,7 @@ def main():
                 if curr_time - last_print_time >= 0.2:
                     last_print_time = curr_time
                     trig_str = "TX" if is_triggered else "--"
-                    print(f"[{mode:12}] T:{elapsed:5.1f}s | XYZ({x:+4.1f},{y:+4.1f},{z:+4.1f}) | "
+                    print(f"[{mode:17}] T:{elapsed:5.1f}s | XYZ({x:+4.1f},{y:+4.1f},{z:+4.1f}) | "
                           f"CMD R/P({math.degrees(target_roll):+4.0f}°,{math.degrees(target_pitch):+4.0f}°) | {trig_str}")
 
                 if flight_state == "LAND" and tgt_z <= 0.0 and z < 0.25:
@@ -422,7 +452,7 @@ def main():
         sock_recv.close()
         sock_send.close()
         if log_data:
-            fname = f"solar_flight_log_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+            fname = f"tree_arc_flight_log_{time.strftime('%Y%m%d_%H%M%S')}.csv"
             with open(fname, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(['Time', 'X', 'Y', 'Z', 'Tgt_X', 'Tgt_Y', 'Tgt_Z', 'Triggered', 'State'])
