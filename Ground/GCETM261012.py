@@ -11,11 +11,12 @@ import os
 import numpy as np
 
 # ==========================================
-# 1. 控制參數設定 (完全保留原有強健控制增益)
+# 1. 控制參數設定 (保留新區間二型模糊強健控制增益)
 # ==========================================
 UAV_MASS = 3.5
 HOVER_FORCE = UAV_MASS * 9.81
 
+# 高度控制矩陣
 OMEGA_ALT = np.array([[11.2683, 16.5707], [16.5707, 25.0074]], dtype=float)
 F1_ALT = np.array([-8.1979, -12.7244], dtype=float)
 SIGMA_ALT = 0.00
@@ -24,6 +25,7 @@ HOVER_THRUST = 0.65
 THRUST_SCALE = 0.045
 THR_MIN, THR_MAX = 0.10, 0.90
 
+# 水平姿態控制矩陣 (X/Y共用)
 OMEGA_POS = np.array([[282.0784, 501.9677], [501.9677, 893.5577]], dtype=float)
 F1_POS = np.array([-2.4604, -4.4041], dtype=float)
 F2_POS = np.array([-2.9273, -5.2102], dtype=float)
@@ -44,35 +46,47 @@ ROLL_PITCH_LIMIT = 0.6
 DT_MIN, DT_MAX = 0.01, 0.03
 
 # ==========================================
-# 🎯 任務與路徑參數 (單排樹列單側外擺圓弧巡檢)
+# 2. VLA 視覺伺服與泛化巡檢參數 (無固定航線、無雲台)
 # ==========================================
-TARGET_Z = 2.5                 # 基準巡檢高度 (公尺)
-Z_VARIATION_AMP = 0.4          # 繞弧過程中的垂直高度微幅起伏 (公尺，獲取高低視角)
-LANDING_SPEED = 0.5
-HOVER_BEFORE_TRAJ = 3.0
-TRANSITION_DURATION = 4.0      # 樹間直線過渡時間 (秒)
+TARGET_Z = 2.0                 # 初始起飛與搜索基準高度
+HOVER_BEFORE_TRAJ = 3.0        # 起飛後穩定懸停時間
+TRANSITION_SPEED = 0.4         # 跨樹轉移時的側向平移速度 (m/s)
+SEARCH_YAW_RATE = 0.15         # 原地搜索目標時的偏航角速度 (rad/s)
+LANDING_SPEED = 0.5            # 降落速度
 
-# 🌲 單排樹列定義 (樹列位於 Y=0 線上，無人機恆在 Y > 0 單側飛行)
-# 格式: (樹木中心 X, 樹木中心 Y)
-TREES = [
-    (3.5, 0.0),   # 第 1 棵樹
-    (7.5, 0.0),   # 第 2 棵樹
-    (11.5, 0.0)   # 第 3 棵樹
-]
+# 2D 像素誤差轉換增益 (Pixel Error to Body Frame Error)
+K_VLA_LATERAL = 0.002          # 像素 X 誤差 -> 機身 Y 軸誤差 (控制 Roll)
+K_VLA_FORWARD = 0.05           # 面積比例誤差 -> 機身 X 軸誤差 (控制 Pitch 距離)
+K_VLA_ALTITUDE = 0.001         # 像素 Y 誤差 -> 高度 Z 軸目標微調
+K_VLA_YAW = 0.001              # 像素 X 誤差 -> 偏航角微調 (將目標對齊中心)
 
-# 弧線幾何參數
-DEFAULT_ARC_RADIUS = 2.4       # 預設繞弧半徑 (公尺)
-MIN_SAFE_Y = 1.2               # 單側防碰撞最小距離邊界 (公尺，保證永不穿越樹列)
-ARC_DURATION = 6.0             # 繞單棵樹單側圓弧的巡航時間 (秒)
-ARC_THETA_START = math.radians(35.0)   # 入弧角 (約 35 度，前斜視角)
-ARC_THETA_END = math.radians(145.0)    # 出弧角 (約 145 度，後斜視角)
-
-SHM_REQ_TEMP = '/dev/shm/uav_req_tmp.json'
-SHM_REQ_PATH = '/dev/shm/uav_req.json'
-SHM_ACT_PATH = '/dev/shm/uav_action.json'
+SHM_VLA_ACT_PATH = '/dev/shm/vla_feedback.json'
 
 # ==========================================
-# 2. ETM 控制器 (完全維持原有增益與歸屬函數架構)
+# 3. VLA 決策讀取函式
+# ==========================================
+def read_vla_feedback():
+    """
+    讀取 VLA 輸出的即時視覺特徵與語意狀態
+    預期 JSON 格式:
+    {
+      "semantic_state": "TRACKING", // 狀態: SEARCH, TRACKING, TRANSITION, DONE
+      "pixel_err_x": 120,           // 影像左右像素誤差 (目標在右為正)
+      "pixel_err_y": -30,           // 影像上下像素誤差 (目標在下為負)
+      "area_err": 0.5,              // 目標大小誤差 (面積太小為正 -> 需前進)
+      "confidence": 0.95
+    }
+    """
+    if not os.path.exists(SHM_VLA_ACT_PATH):
+        return None
+    try:
+        with open(SHM_VLA_ACT_PATH, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+# ==========================================
+# 4. 新區間二型分段多項式模糊網路控制器 (ETM)
 # ==========================================
 class Altitude_ETM_Controller:
     def __init__(self):
@@ -105,113 +119,51 @@ class Fuzzy_ETM_Core:
         self.last_control_u, self.prev_final_u = 0.0, 0.0
         self.first_run, self.last_trigger_time = True, 0.0
 
-    def update(self, current_state, target_val, dt, current_time):
-        r_input = np.array([0.0, 4.0 * target_val], dtype=float)
-        self.ref_state += (self.Ar @ self.ref_state + r_input) * dt
-        e_trk = current_state - self.ref_state
+    def update(self, error_body_frame, error_vel_body, dt, current_time):
+        """
+        將 VLA 降維映射後的機身體系誤差直接輸入控制器，
+        透過歸屬函數處理非線性擾動與視覺延遲。
+        """
+        e_trk = np.array([error_body_frame, error_vel_body], dtype=float)
         e_net = self.last_sent_error - e_trk
+        
         term_net = float(e_net.T @ self.Omega @ e_net)
         term_trk = float(e_trk.T @ self.Omega @ e_trk)
+        
         triggered = False
         if self.first_run or ((term_net > SIGMA_POS * term_trk) and ((current_time - self.last_trigger_time) >= MIN_TRIGGER_INTERVAL)):
             triggered = True
             self.first_run = False
             self.last_trigger_time = current_time
             self.last_sent_error = e_trk.copy()
+            
         self.filtered_error += (dt / TAU_FILTER_XY) * (self.last_sent_error - self.filtered_error)
         e_ctrl = self.filtered_error.copy()
+        
         if abs(e_ctrl[0]) < POS_DEADZONE_XY: e_ctrl[0] = 0.0
         if abs(e_ctrl[1]) < VEL_DEADZONE_XY: e_ctrl[1] = 0.0
-        # 依據追蹤誤差計算模糊歸屬函數權重 w2
+        
+        # 核心：依據追蹤誤差計算區間二型模糊歸屬函數 (Membership Function) 權重 w2
         w2 = float(np.clip(abs(float(e_trk[0])) / POS_ERR_MAX, 0.0, 1.0))
         F_fuzzy = (1.0 - w2) * self.F1 + w2 * self.F2
+        
         alpha = max(min(1.0, float(np.linalg.norm(e_ctrl)) / SOFT_ERR_XY), ALPHA_MIN)
         u_raw = float(alpha * (F_fuzzy @ e_ctrl) * GAIN_SCALE_XY)
         du = (u_raw - self.prev_final_u) / dt
         u_final = self.prev_final_u + np.sign(du) * RATE_LIMIT_XY * dt if abs(du) > RATE_LIMIT_XY else u_raw
+        
         self.last_control_u = self.prev_final_u = float(u_final)
         return self.last_control_u, triggered
 
 # ==========================================
-# 3. 軌跡幾何計算函式
-# ==========================================
-def min_jerk(t, T, p0, pf):
-    t = max(0.0, min(t, T))
-    tau = t / T
-    tau3, tau4, tau5 = tau**3, tau**4, tau**5
-    pos = p0 + (pf - p0) * (10*tau3 - 15*tau4 + 6*tau5)
-    vel = (pf - p0) / T * (30*tau**2 - 60*tau3 + 30*tau4)
-    acc = (pf - p0) / (T**2) * (60*tau - 180*tau**2 + 120*tau3)
-    return pos, vel, acc
-
-def calculate_tree_arc(tree_x, tree_y, radius, t_seg, T_total, z_base):
-    """
-    計算圍繞單棵樹單側的凸外擺圓弧 (X 方向單向朝前前進，Y 軸恆維持在單側正值)
-    """
-    t_clamped = max(0.0, min(t_seg, T_total))
-    theta, dtheta, ddtheta = min_jerk(t_clamped, T_total, ARC_THETA_START, ARC_THETA_END)
-
-    # 圓弧軌跡幾何 (半徑 R 沿著單側外擺)
-    # x = tree_x - R * cos(theta), y = tree_y + R * sin(theta)
-    x = tree_x - radius * math.cos(theta)
-    y = max(tree_y + radius * math.sin(theta), MIN_SAFE_Y)
-
-    # 速度前饋 (連鎖律)
-    vx = radius * math.sin(theta) * dtheta
-    vy = radius * math.cos(theta) * dtheta
-
-    # 加速度前饋
-    ax = radius * (math.cos(theta) * (dtheta**2) + math.sin(theta) * ddtheta)
-    ay = radius * (-math.sin(theta) * (dtheta**2) + math.cos(theta) * ddtheta)
-
-    # 高度微幅升降正弦波 (增加俯仰多角度取樣)
-    tau = t_clamped / T_total
-    z = z_base + Z_VARIATION_AMP * math.sin(2.0 * math.pi * tau)
-    vz = Z_VARIATION_AMP * (2.0 * math.pi / T_total) * math.cos(2.0 * math.pi * tau)
-    az = -Z_VARIATION_AMP * ((2.0 * math.pi / T_total)**2) * math.sin(2.0 * math.pi * tau)
-
-    return x, y, z, vx, vy, vz, ax, ay, az
-
-def get_arc_start_point(tree_x, tree_y, radius):
-    """計算進入圓弧的起點座標 (前斜視角起點)"""
-    x = tree_x - radius * math.cos(ARC_THETA_START)
-    y = max(tree_y + radius * math.sin(ARC_THETA_START), MIN_SAFE_Y)
-    return x, y
-
-def request_vla_inference(req_id, tree_index):
-    req_data = {
-        "req_id": int(req_id),
-        "tree_index": int(tree_index),
-        "task": "ALIGN_TREE_SINGLE_SIDE",
-        "timestamp": time.time()
-    }
-    with open(SHM_REQ_TEMP, 'w') as f:
-        json.dump(req_data, f)
-    os.replace(SHM_REQ_TEMP, SHM_REQ_PATH)
-
-def read_vla_decision(expected_req_id):
-    """讀取 VLA 決策：微調單側圓弧半徑與觀測高度"""
-    if not os.path.exists(SHM_ACT_PATH):
-        return None
-    try:
-        with open(SHM_ACT_PATH, 'r') as f:
-            act = json.load(f)
-        if act.get("event_id", -1) == expected_req_id and act.get("action") == "TREE_ARC_ALIGN":
-            return act
-    except Exception:
-        pass
-    return None
-
-# ==========================================
-# 4. 主程式
+# 5. 主程式
 # ==========================================
 def main():
-    for p in [SHM_REQ_PATH, SHM_ACT_PATH]:
-        if os.path.exists(p):
-            try: os.remove(p)
-            except OSError: pass
+    if os.path.exists(SHM_VLA_ACT_PATH):
+        try: os.remove(SHM_VLA_ACT_PATH)
+        except OSError: pass
 
-    PI_IP = input("請輸入樹莓派 IP: ").strip()
+    PI_IP = input("請輸入樹莓派 IP (本地模擬請輸入 127.0.0.1): ").strip()
     UDP_LISTEN_PORT, UDP_SEND_PORT = 5006, 5005
 
     sock_recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -220,26 +172,20 @@ def main():
     sock_send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     alt_ctrl = Altitude_ETM_Controller()
-    etm_pos_x = Fuzzy_ETM_Core(OMEGA_POS, F1_POS, F2_POS, AR_POS)
-    etm_pos_y = Fuzzy_ETM_Core(OMEGA_POS, F1_POS, F2_POS, AR_POS)
+    etm_pos_x = Fuzzy_ETM_Core(OMEGA_POS, F1_POS, F2_POS, AR_POS) # 控制機身 X (Pitch)
+    etm_pos_y = Fuzzy_ETM_Core(OMEGA_POS, F1_POS, F2_POS, AR_POS) # 控制機身 Y (Roll)
     
     log_data = []
     home_initialized = False
     home_x = home_y = 0.0
-    last_cmd_roll, last_cmd_pitch = 0.0, 0.0
+    last_cmd_roll = last_cmd_pitch = target_yaw = 0.0
 
     flight_state = "HOVER_HOME"
-    tree_idx = 0
-    current_target_x = current_target_y = 0.0
-    start_pos_x = start_pos_y = start_pos_z = 0.0
-    transition_start_time = wait_vla_start_time = 0.0
-    current_req_id = 0
+    target_z = TARGET_Z
+    transition_start_time = 0.0
+    tree_count = 0
 
-    active_radius = DEFAULT_ARC_RADIUS
-    active_tree_z = TARGET_Z
-
-    print(f"\n[Ground Controller] 已啟用【單排樹列單側外擺圓弧巡檢】模式！共 {len(TREES)} 棵樹。")
-    print(f"[Ground Controller] 固定相機配置：透過單向外擺圓弧獲得 前斜 ➔ 正側 ➔ 後斜 多角度觀測。")
+    print("\n[Ground Controller] 已啟用【無雲台 VLA 泛化追蹤】模式！")
     print("[Ground Controller] 等待心跳包...")
 
     start_time = prev_time = None
@@ -258,6 +204,7 @@ def main():
 
                 if not home_initialized:
                     home_x, home_y = x, y
+                    target_yaw = yaw
                     start_time = prev_time = curr_time
                     home_initialized = True
                     print(f"✅ Home 鎖定: X={home_x:.2f}, Y={home_y:.2f}。準備爬升至 {TARGET_Z}m...")
@@ -266,180 +213,129 @@ def main():
                 prev_time = curr_time
                 elapsed = curr_time - start_time
 
-                tgt_vx = tgt_vy = tgt_ax = tgt_ay = 0.0
-                tgt_z = TARGET_Z
+                # 直接生成機身座標系的控制誤差 (Body Frame Errors)
+                err_b_x = 0.0
+                err_b_y = 0.0
+                err_b_vx = vx * math.cos(yaw) + vy * math.sin(yaw)  # 估測速度投影至機身 X
+                err_b_vy = -vx * math.sin(yaw) + vy * math.cos(yaw) # 估測速度投影至機身 Y
+                
+                # 讀取高階 VLA 語意指令
+                vla_data = read_vla_feedback()
+                vla_state = vla_data.get("semantic_state", "SEARCH") if vla_data else "SEARCH"
 
                 # --------------------------------------------------
-                # 1. 爬升與初始懸停
+                # 狀態機與 VLA 控制映射
                 # --------------------------------------------------
                 if flight_state == "HOVER_HOME":
                     mode = "Hover_Home"
-                    target_x, target_y = home_x, home_y
-                    if elapsed > HOVER_BEFORE_TRAJ and abs(z - TARGET_Z) < 0.35 and len(TREES) > 0:
-                        flight_state = "APPROACH_ARC_ENTRY"
-                        start_pos_x, start_pos_y = x, y
-                        # 計算第 1 棵樹的入弧起點
-                        tx, ty = TREES[tree_idx]
-                        entry_x, entry_y = get_arc_start_point(home_x + tx, home_y + ty, DEFAULT_ARC_RADIUS)
-                        current_target_x, current_target_y = entry_x, entry_y
-                        transition_start_time = curr_time
-                        print(f"\n🚀 啟程前往樹木 {tree_idx+1}/{len(TREES)} 入弧點: ({current_target_x:.2f}, {current_target_y:.2f})")
+                    err_b_x = (x - home_x) * math.cos(yaw) + (y - home_y) * math.sin(yaw)
+                    err_b_y = -(x - home_x) * math.sin(yaw) + (y - home_y) * math.cos(yaw)
+                    if elapsed > HOVER_BEFORE_TRAJ and abs(z - TARGET_Z) < 0.35:
+                        flight_state = "VLA_SEARCH"
+                        print("\n🚀 爬升完成，切換至 VLA 尋找目標狀態...")
 
-                # --------------------------------------------------
-                # 2. 飛往外擺圓弧切入點 (單向平滑前進)
-                # --------------------------------------------------
-                elif flight_state == "APPROACH_ARC_ENTRY":
-                    mode = f"Appr_T{tree_idx+1}"
-                    t_seg = curr_time - transition_start_time
-                    if t_seg < TRANSITION_DURATION:
-                        target_x, tgt_vx, tgt_ax = min_jerk(t_seg, TRANSITION_DURATION, start_pos_x, current_target_x)
-                        target_y, tgt_vy, tgt_ay = min_jerk(t_seg, TRANSITION_DURATION, start_pos_y, current_target_y)
-                    else:
-                        target_x, target_y = current_target_x, current_target_y
-                        dist_err = math.hypot(x - current_target_x, y - current_target_y)
-                        vel_xy = math.hypot(vx, vy)
+                elif flight_state == "VLA_SEARCH":
+                    mode = "VLA_Search"
+                    target_yaw += SEARCH_YAW_RATE * dt  # 原地旋轉尋找第一棵樹
+                    err_b_x = err_b_y = 0.0             # 保持水平位置
+                    if vla_state == "TRACKING":
+                        flight_state = "VLA_TRACKING"
+                        tree_count += 1
+                        print(f"\n🎯 [VLA] 鎖定第 {tree_count} 棵樹！進入閉環動態追蹤。")
+
+                elif flight_state == "VLA_TRACKING":
+                    mode = "VLA_Track"
+                    if vla_data:
+                        # 2D 像素誤差映射至 3D 機身姿態誤差 (核心)
+                        pixel_x = vla_data.get("pixel_err_x", 0.0)
+                        pixel_y = vla_data.get("pixel_err_y", 0.0)
+                        area_e = vla_data.get("area_err", 0.0)
+
+                        # 1. Yaw：微調偏航角將目標置中
+                        target_yaw = yaw - K_VLA_YAW * pixel_x
                         
-                        if (dist_err < 0.35 and vel_xy < 0.30) or (t_seg > TRANSITION_DURATION + 3.0):
-                            flight_state = "WAIT_VLA_ARC"
-                            wait_vla_start_time = curr_time
-                            current_req_id += 1
-                            request_vla_inference(current_req_id, tree_idx + 1)
-                            print(f"\n📍 已抵達樹木 {tree_idx+1} 入弧前哨點！發送 VLA 幾何參數推論 (req_id={current_req_id})")
+                        # 2. X 軸 (Pitch)：依據面積誤差控制前後距離
+                        err_b_x = K_VLA_FORWARD * area_e
+                        
+                        # 3. Y 軸 (Roll)：輔助側向對齊與抗風擾
+                        err_b_y = K_VLA_LATERAL * pixel_x
+                        
+                        # 4. Z 軸：高度微調對準樹冠交界
+                        target_z = max(0.5, min(TARGET_Z - K_VLA_ALTITUDE * pixel_y, 4.0))
 
-                # --------------------------------------------------
-                # 3. 等待 VLA 微調圓弧半徑與相機對準參數
-                # --------------------------------------------------
-                elif flight_state == "WAIT_VLA_ARC":
-                    mode = "Wait_VLA"
-                    target_x, target_y = current_target_x, current_target_y
+                    if vla_state == "TRANSITION":
+                        flight_state = "VLA_TRANSITION"
+                        transition_start_time = curr_time
+                        print(f"\n🔄 [VLA] 樹木巡檢完成，開始橫向平移尋找下一目標...")
                     
-                    vla_cmd = read_vla_decision(current_req_id)
-                    vla_ready = False
-
-                    if vla_cmd is not None:
-                        # VLA 根據畫面微調圓弧半徑 (delta_radius) 與觀測高度 (delta_z)
-                        delta_r = float(vla_cmd.get("delta_radius", 0.0))
-                        delta_z = float(vla_cmd.get("delta_z", 0.0))
-                        active_radius = float(np.clip(DEFAULT_ARC_RADIUS + delta_r, 1.8, 3.5))
-                        active_tree_z = float(np.clip(TARGET_Z + delta_z, 1.5, 4.5))
-                        vla_ready = True
-                        print(f"🌲 [VLA 幾何確定] 半徑調整至 R={active_radius:.2f}m, 基準高度 Z={active_tree_z:.2f}m")
-
-                    elif (curr_time - wait_vla_start_time) > 2.0:
-                        # 逾時預設值
-                        active_radius = DEFAULT_ARC_RADIUS
-                        active_tree_z = TARGET_Z
-                        vla_ready = True
-                        print(f"⚠️ [VLA 回報逾時] 使用預設外擺半徑 R={active_radius:.2f}m, Z={active_tree_z:.2f}m")
-
-                    if vla_ready:
-                        flight_state = "EXECUTE_TREE_ARC"
+                    elif vla_state == "DONE":
+                        flight_state = "RETURN_HOME"
                         transition_start_time = curr_time
-                        print(f"🔄 開始執行單側外擺圓弧巡航 (單向朝 +X 前進，取得前斜/正側/後斜多視角)...")
+                        print("\n🏁 [VLA] 收到 Done Token，全陣列樹木巡檢完成，啟動返航！")
 
-                # --------------------------------------------------
-                # 4. 執行單側凸外擺圓弧 (朝同方向移動 + 繞圓弧多角度取樣)
-                # --------------------------------------------------
-                elif flight_state == "EXECUTE_TREE_ARC":
-                    t_seg = curr_time - transition_start_time
-                    tx, ty = TREES[tree_idx]
-                    center_x, center_y = home_x + tx, home_y + ty
-
-                    target_x, target_y, tgt_z, tgt_vx, tgt_vy, tgt_z_vel, tgt_ax, tgt_ay, tgt_z_acc = calculate_tree_arc(
-                        center_x, center_y, active_radius, t_seg, ARC_DURATION, active_tree_z
-                    )
-
-                    # 當前視角辨識 (前斜、正側、後斜)
-                    tau = min(1.0, t_seg / ARC_DURATION)
-                    if tau < 0.35:
-                        mode = f"Arc_FrontOblique"
-                    elif tau < 0.65:
-                        mode = f"Arc_SideOrth"
-                    else:
-                        mode = f"Arc_RearOblique"
-
-                    if t_seg >= ARC_DURATION:
-                        tree_idx += 1
-                        start_pos_x, start_pos_y, start_pos_z = x, y, z
+                elif flight_state == "VLA_TRANSITION":
+                    mode = "VLA_Trans"
+                    # 在跨樹轉換時，不控制 Pitch (err_b_x = 0)，強制 Roll 輸出側向移動
+                    err_b_x = 0.0 
+                    err_b_y = -TRANSITION_SPEED * dt # 強制側風位移誤差，使控制器產生對應 Roll
+                    
+                    if vla_state == "TRACKING" and (curr_time - transition_start_time > 2.0):
+                        flight_state = "VLA_TRACKING"
+                        tree_count += 1
+                        print(f"\n🎯 [VLA] 捕獲新特徵，鎖定第 {tree_count} 棵樹！")
+                    elif vla_state == "DONE":
+                        flight_state = "RETURN_HOME"
                         transition_start_time = curr_time
 
-                        if tree_idx < len(TREES):
-                            # 前往下一個樹木的入弧起點 (載具持續朝 +X 前進，不回頭)
-                            next_tx, next_ty = TREES[tree_idx]
-                            current_target_x, current_target_y = get_arc_start_point(home_x + next_tx, home_y + next_ty, DEFAULT_ARC_RADIUS)
-                            flight_state = "APPROACH_ARC_ENTRY"
-                            print(f"\n✅ 樹木 {tree_idx} 單側多角度觀測完成！直飛下一棵樹入弧點: ({current_target_x:.2f}, {current_target_y:.2f})")
-                        else:
-                            flight_state = "RETURN_HOME"
-                            print("\n🏁 整排樹列單側巡檢完成，啟動返航程序！")
-
-                # --------------------------------------------------
-                # 5. 返航程序
-                # --------------------------------------------------
                 elif flight_state == "RETURN_HOME":
                     mode = "Return_Home"
-                    t_seg = curr_time - transition_start_time
-                    if t_seg < TRANSITION_DURATION + 2.0:
-                        target_x, tgt_vx, tgt_ax = min_jerk(t_seg, TRANSITION_DURATION + 2.0, start_pos_x, home_x)
-                        target_y, tgt_vy, tgt_ay = min_jerk(t_seg, TRANSITION_DURATION + 2.0, start_pos_y, home_y)
-                    else:
-                        target_x, target_y = home_x, home_y
-                        dist_home = math.hypot(x - home_x, y - home_y)
-                        if dist_home < 0.40 or (t_seg > TRANSITION_DURATION + 5.0):
-                            flight_state = "LAND"
-                            transition_start_time = curr_time
-                            print("\n🛬 已抵達起飛點正上方，開始垂直降落...")
+                    err_w_x, err_w_y = x - home_x, y - home_y
+                    err_b_x = err_w_x * math.cos(yaw) + err_w_y * math.sin(yaw)
+                    err_b_y = -err_w_x * math.sin(yaw) + err_w_y * math.cos(yaw)
+                    dist_home = math.hypot(err_w_x, err_w_y)
+                    if dist_home < 0.40:
+                        flight_state = "LAND"
+                        transition_start_time = curr_time
+                        print("\n🛬 抵達 TurtleBot 4 (Home) 正上方，啟動降落...")
 
-                # --------------------------------------------------
-                # 6. 垂直降落
-                # --------------------------------------------------
                 elif flight_state == "LAND":
                     mode = "Land"
-                    target_x, target_y = home_x, home_y
+                    err_w_x, err_w_y = x - home_x, y - home_y
+                    err_b_x = err_w_x * math.cos(yaw) + err_w_y * math.sin(yaw)
+                    err_b_y = -err_w_x * math.sin(yaw) + err_w_y * math.cos(yaw)
                     t_land = curr_time - transition_start_time
-                    tgt_z = max(0.0, TARGET_Z - LANDING_SPEED * t_land)
+                    target_z = max(0.0, TARGET_Z - LANDING_SPEED * t_land)
 
                 # ==========================================
-                # 控制量計算 (完全保留原有增益與歸屬函數架構)
+                # 控制量計算 (直接將機身誤差代入區間二型模糊歸屬函數)
                 # ==========================================
-                u_accel, trig_z = alt_ctrl.update(np.array([z, vz], dtype=float), tgt_z, dt)
+                u_accel, trig_z = alt_ctrl.update(np.array([z, vz], dtype=float), target_z, dt)
                 thrust_cmd = float(np.clip((HOVER_THRUST + u_accel * THRUST_SCALE) / max(math.cos(last_cmd_roll) * math.cos(last_cmd_pitch), 0.5), THR_MIN, THR_MAX))
-
-                cos_y, sin_y = math.cos(yaw), math.sin(yaw)
-                err_w_x, err_w_y = x - target_x, y - target_y
-                err_w_vx, err_w_vy = vx - tgt_vx, vy - tgt_vy
-
-                # 機體座標誤差轉換
-                err_b_x = err_w_x * cos_y + err_w_y * sin_y
-                err_b_y = -err_w_x * sin_y + err_w_y * cos_y
-                err_b_vx = err_w_vx * cos_y + err_w_vy * sin_y
-                err_b_vy = -err_w_vx * sin_y + err_w_vy * cos_y
-                ff_b_ax = tgt_ax * cos_y + tgt_ay * sin_y
-                ff_b_ay = -tgt_ax * sin_y + tgt_ay * cos_y
                 
-                # 區間二型模糊 ETM 核心計算
-                u_pitch, trig_x = etm_pos_x.update(np.array([err_b_x, err_b_vx], dtype=float), 0.0, dt, curr_time)
-                u_roll, trig_y = etm_pos_y.update(np.array([err_b_y, err_b_vy], dtype=float), 0.0, dt, curr_time)
+                # 將映射好的機身體系誤差送入模糊網路控制器
+                u_pitch, trig_x = etm_pos_x.update(err_b_x, err_b_vx, dt, curr_time)
+                u_roll, trig_y = etm_pos_y.update(err_b_y, err_b_vy, dt, curr_time)
 
-                target_roll = float(np.clip(-u_roll + ff_b_ay * FF_ACCEL_GAIN, -ROLL_PITCH_LIMIT, ROLL_PITCH_LIMIT))
-                target_pitch = float(np.clip(-u_pitch - ff_b_ax * FF_ACCEL_GAIN, -ROLL_PITCH_LIMIT, ROLL_PITCH_LIMIT))
+                target_roll = float(np.clip(-u_roll, -ROLL_PITCH_LIMIT, ROLL_PITCH_LIMIT))
+                target_pitch = float(np.clip(-u_pitch, -ROLL_PITCH_LIMIT, ROLL_PITCH_LIMIT))
                 last_cmd_roll, last_cmd_pitch = target_roll, target_pitch
                 
                 is_triggered = int(trig_x or trig_y or trig_z)
                 if is_triggered or (curr_time - last_send_time > 0.4):
-                    sock_send.sendto(struct.pack("<4fd", target_roll, target_pitch, 0.0, thrust_cmd, curr_time), (PI_IP, UDP_SEND_PORT))
+                    # 傳送 R, P, Yaw, Thrust
+                    sock_send.sendto(struct.pack("<4fd", target_roll, target_pitch, target_yaw, thrust_cmd, curr_time), (PI_IP, UDP_SEND_PORT))
                     last_send_time = curr_time
 
-                log_data.append([elapsed, x, y, z, target_x, target_y, tgt_z, is_triggered, flight_state])
+                log_data.append([elapsed, x, y, z, err_b_x, err_b_y, target_z, is_triggered, flight_state])
 
                 if curr_time - last_print_time >= 0.2:
                     last_print_time = curr_time
                     trig_str = "TX" if is_triggered else "--"
-                    print(f"[{mode:17}] T:{elapsed:5.1f}s | XYZ({x:+4.1f},{y:+4.1f},{z:+4.1f}) | "
-                          f"CMD R/P({math.degrees(target_roll):+4.0f}°,{math.degrees(target_pitch):+4.0f}°) | {trig_str}")
+                    print(f"[{mode:12}] T:{elapsed:5.1f}s | XYZ({x:+4.1f},{y:+4.1f},{z:+4.1f}) | "
+                          f"CMD R/P/Y({math.degrees(target_roll):+3.0f}°,{math.degrees(target_pitch):+3.0f}°,{math.degrees(target_yaw):+3.0f}°) | {trig_str}")
 
-                if flight_state == "LAND" and tgt_z <= 0.0 and z < 0.25:
-                    print("\n[Ground Controller] 已落地，馬達全數鎖定！")
+                if flight_state == "LAND" and target_z <= 0.0 and z < 0.25:
+                    print("\n[Ground Controller] 已降落於移動載具，馬達全數鎖定！")
                     stop_msg = struct.pack("<4fd", 0.0, 0.0, 0.0, 0.0, time.time())
                     for _ in range(10):
                         sock_send.sendto(stop_msg, (PI_IP, UDP_SEND_PORT))
@@ -452,10 +348,10 @@ def main():
         sock_recv.close()
         sock_send.close()
         if log_data:
-            fname = f"tree_arc_flight_log_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+            fname = f"vla_generalization_log_{time.strftime('%Y%m%d_%H%M%S')}.csv"
             with open(fname, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['Time', 'X', 'Y', 'Z', 'Tgt_X', 'Tgt_Y', 'Tgt_Z', 'Triggered', 'State'])
+                writer.writerow(['Time', 'X', 'Y', 'Z', 'Err_B_X', 'Err_B_Y', 'Tgt_Z', 'Triggered', 'State'])
                 writer.writerows(log_data)
             print(f"[Ground Controller] 紀錄已存至 {fname}")
 
