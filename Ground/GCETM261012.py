@@ -11,12 +11,11 @@ import os
 import numpy as np
 
 # ==========================================
-# 1. 控制參數設定 (保留新區間二型模糊強健控制增益)
+# 1. 區間二型控制參數設定
 # ==========================================
 UAV_MASS = 3.5
 HOVER_FORCE = UAV_MASS * 9.81
 
-# 高度控制矩陣
 OMEGA_ALT = np.array([[11.2683, 16.5707], [16.5707, 25.0074]], dtype=float)
 F1_ALT = np.array([-8.1979, -12.7244], dtype=float)
 SIGMA_ALT = 0.00
@@ -25,7 +24,6 @@ HOVER_THRUST = 0.65
 THRUST_SCALE = 0.045
 THR_MIN, THR_MAX = 0.10, 0.90
 
-# 水平姿態控制矩陣 (X/Y共用)
 OMEGA_POS = np.array([[282.0784, 501.9677], [501.9677, 893.5577]], dtype=float)
 F1_POS = np.array([-2.4604, -4.4041], dtype=float)
 F2_POS = np.array([-2.9273, -5.2102], dtype=float)
@@ -46,47 +44,30 @@ ROLL_PITCH_LIMIT = 0.6
 DT_MIN, DT_MAX = 0.01, 0.03
 
 # ==========================================
-# 2. VLA 視覺伺服與泛化巡檢參數 (無固定航線、無雲台)
+# 2. VLA 泛化巡檢參數
 # ==========================================
-TARGET_Z = 2.0                 # 初始起飛與搜索基準高度
-HOVER_BEFORE_TRAJ = 3.0        # 起飛後穩定懸停時間
-TRANSITION_SPEED = 0.4         # 跨樹轉移時的側向平移速度 (m/s)
-SEARCH_YAW_RATE = 0.15         # 原地搜索目標時的偏航角速度 (rad/s)
-LANDING_SPEED = 0.5            # 降落速度
+TARGET_Z = 1.3                 
+HOVER_BEFORE_TRAJ = 3.0        
+TRANSITION_SPEED = 0.4         
+SEARCH_YAW_RATE = 0.15         
+LANDING_SPEED = 0.5            
 
-# 2D 像素誤差轉換增益 (Pixel Error to Body Frame Error)
-K_VLA_LATERAL = 0.002          # 像素 X 誤差 -> 機身 Y 軸誤差 (控制 Roll)
-K_VLA_FORWARD = 0.05           # 面積比例誤差 -> 機身 X 軸誤差 (控制 Pitch 距離)
-K_VLA_ALTITUDE = 0.001         # 像素 Y 誤差 -> 高度 Z 軸目標微調
-K_VLA_YAW = 0.001              # 像素 X 誤差 -> 偏航角微調 (將目標對齊中心)
+K_VLA_LATERAL = 0.002          
+K_VLA_FORWARD = 0.05           
+K_VLA_ALTITUDE = 0.001         
+K_VLA_YAW = 0.001          
 
-SHM_VLA_ACT_PATH = '/dev/shm/vla_feedback.json'
+# [新增] 安全防護網限制參數
+MAX_SAFE_AREA = 0.60           # 視覺防撞閾值 (樹木佔畫面 60% 即視為過近)
+EMERGENCY_BACKWARD_ERR = -2.0  # 緊急後退的強勢機身 X 軸誤差 (公尺)
+MIN_Z_LIMIT = 1.0              # 高度包絡線：最低飛行高度限制
+MAX_Z_LIMIT = 1.8              # 高度包絡線：最高飛行高度限制   
 
-# ==========================================
-# 3. VLA 決策讀取函式
-# ==========================================
-def read_vla_feedback():
-    """
-    讀取 VLA 輸出的即時視覺特徵與語意狀態
-    預期 JSON 格式:
-    {
-      "semantic_state": "TRACKING", // 狀態: SEARCH, TRACKING, TRANSITION, DONE
-      "pixel_err_x": 120,           // 影像左右像素誤差 (目標在右為正)
-      "pixel_err_y": -30,           // 影像上下像素誤差 (目標在下為負)
-      "area_err": 0.5,              // 目標大小誤差 (面積太小為正 -> 需前進)
-      "confidence": 0.95
-    }
-    """
-    if not os.path.exists(SHM_VLA_ACT_PATH):
-        return None
-    try:
-        with open(SHM_VLA_ACT_PATH, 'r') as f:
-            return json.load(f)
-    except Exception:
-        return None
+ # [新增] VLA 看門狗與超時設定
+VLA_TIMEOUT_LIMIT = 1.0        # 推論資料超時極限 (秒) - 若超過 1 秒未收到新推論，視為斷線或卡死
 
 # ==========================================
-# 4. 新區間二型分段多項式模糊網路控制器 (ETM)
+# 3. 新區間二型分段多項式模糊網路控制器 (ETM)
 # ==========================================
 class Altitude_ETM_Controller:
     def __init__(self):
@@ -120,10 +101,6 @@ class Fuzzy_ETM_Core:
         self.first_run, self.last_trigger_time = True, 0.0
 
     def update(self, error_body_frame, error_vel_body, dt, current_time):
-        """
-        將 VLA 降維映射後的機身體系誤差直接輸入控制器，
-        透過歸屬函數處理非線性擾動與視覺延遲。
-        """
         e_trk = np.array([error_body_frame, error_vel_body], dtype=float)
         e_net = self.last_sent_error - e_trk
         
@@ -143,7 +120,7 @@ class Fuzzy_ETM_Core:
         if abs(e_ctrl[0]) < POS_DEADZONE_XY: e_ctrl[0] = 0.0
         if abs(e_ctrl[1]) < VEL_DEADZONE_XY: e_ctrl[1] = 0.0
         
-        # 核心：依據追蹤誤差計算區間二型模糊歸屬函數 (Membership Function) 權重 w2
+        # 依據追蹤誤差計算區間二型模糊歸屬函數 (Membership Function) 權重 w2
         w2 = float(np.clip(abs(float(e_trk[0])) / POS_ERR_MAX, 0.0, 1.0))
         F_fuzzy = (1.0 - w2) * self.F1 + w2 * self.F2
         
@@ -156,24 +133,32 @@ class Fuzzy_ETM_Core:
         return self.last_control_u, triggered
 
 # ==========================================
-# 5. 主程式
+# 4. 主程式
 # ==========================================
 def main():
-    if os.path.exists(SHM_VLA_ACT_PATH):
-        try: os.remove(SHM_VLA_ACT_PATH)
-        except OSError: pass
+    PI_IP = input("請輸入樹莓派/Jetson IP (本地模擬請輸入 127.0.0.1): ").strip()
+    if not PI_IP:
+        PI_IP = "127.0.0.1"
 
-    PI_IP = input("請輸入樹莓派 IP (本地模擬請輸入 127.0.0.1): ").strip()
-    UDP_LISTEN_PORT, UDP_SEND_PORT = 5006, 5005
+    # UDP 埠口配置
+    UDP_LISTEN_PORT = 5006  # 接收飛控物理狀態
+    UDP_SEND_PORT = 5005    # 發送控制指令給飛控
+    VLA_LISTEN_PORT = 5007  # 接收 VLA 視覺網路回饋
 
     sock_recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock_recv.bind(("0.0.0.0", UDP_LISTEN_PORT))
     sock_recv.settimeout(0.5)
+    
     sock_send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    
+    # 建立非阻塞的 VLA 專用接收 Socket
+    sock_vla = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock_vla.bind(("0.0.0.0", VLA_LISTEN_PORT))
+    sock_vla.setblocking(False)
 
     alt_ctrl = Altitude_ETM_Controller()
-    etm_pos_x = Fuzzy_ETM_Core(OMEGA_POS, F1_POS, F2_POS, AR_POS) # 控制機身 X (Pitch)
-    etm_pos_y = Fuzzy_ETM_Core(OMEGA_POS, F1_POS, F2_POS, AR_POS) # 控制機身 Y (Roll)
+    etm_pos_x = Fuzzy_ETM_Core(OMEGA_POS, F1_POS, F2_POS, AR_POS) 
+    etm_pos_y = Fuzzy_ETM_Core(OMEGA_POS, F1_POS, F2_POS, AR_POS) 
     
     log_data = []
     home_initialized = False
@@ -184,15 +169,33 @@ def main():
     target_z = TARGET_Z
     transition_start_time = 0.0
     tree_count = 0
+    vla_data = None
 
-    print("\n[Ground Controller] 已啟用【無雲台 VLA 泛化追蹤】模式！")
-    print("[Ground Controller] 等待心跳包...")
+    print("\n[Ground Controller] 已啟用【無雲台跨網段 VLA 泛化追蹤】模式！")
+    print(f"[Ground Controller] 監聽物理狀態: Port {UDP_LISTEN_PORT} | 監聽視覺回饋: Port {VLA_LISTEN_PORT}")
 
     start_time = prev_time = None
     last_print_time = last_send_time = 0.0
+    
+    vla_data = None
+    last_vla_recv_time = time.time()  # [新增] 紀錄最後一次成功接收 VLA 資料的本地時間
 
     try:
         while True:
+            # 1. 快速排空 VLA 佇列，獲取最新推論結果 (非阻塞讀取)
+            while True:
+                try:
+                    data_vla, _ = sock_vla.recvfrom(1024)
+                    vla_data = json.loads(data_vla.decode('utf-8'))
+                    
+                    # 👉 這裡加入第 2 點：成功收到新資料，刷新看門狗時間
+                    last_vla_recv_time = time.time()
+                except BlockingIOError:
+                    break 
+                except Exception:
+                    break
+
+            # 2. 阻塞讀取飛控物理狀態
             try:
                 data, addr = sock_recv.recvfrom(1024)
             except socket.timeout:
@@ -207,20 +210,17 @@ def main():
                     target_yaw = yaw
                     start_time = prev_time = curr_time
                     home_initialized = True
-                    print(f"✅ Home 鎖定: X={home_x:.2f}, Y={home_y:.2f}。準備爬升至 {TARGET_Z}m...")
+                    print(f"✅ Home 鎖定: X={home_x:.2f}, Y={home_y:.2f}。準備爬升...")
 
                 dt = min(max(curr_time - prev_time, DT_MIN), DT_MAX)
                 prev_time = curr_time
                 elapsed = curr_time - start_time
 
-                # 直接生成機身座標系的控制誤差 (Body Frame Errors)
                 err_b_x = 0.0
                 err_b_y = 0.0
-                err_b_vx = vx * math.cos(yaw) + vy * math.sin(yaw)  # 估測速度投影至機身 X
-                err_b_vy = -vx * math.sin(yaw) + vy * math.cos(yaw) # 估測速度投影至機身 Y
+                err_b_vx = vx * math.cos(yaw) + vy * math.sin(yaw)  
+                err_b_vy = -vx * math.sin(yaw) + vy * math.cos(yaw) 
                 
-                # 讀取高階 VLA 語意指令
-                vla_data = read_vla_feedback()
                 vla_state = vla_data.get("semantic_state", "SEARCH") if vla_data else "SEARCH"
 
                 # --------------------------------------------------
@@ -236,8 +236,8 @@ def main():
 
                 elif flight_state == "VLA_SEARCH":
                     mode = "VLA_Search"
-                    target_yaw += SEARCH_YAW_RATE * dt  # 原地旋轉尋找第一棵樹
-                    err_b_x = err_b_y = 0.0             # 保持水平位置
+                    target_yaw += SEARCH_YAW_RATE * dt
+                    err_b_x = err_b_y = 0.0             
                     if vla_state == "TRACKING":
                         flight_state = "VLA_TRACKING"
                         tree_count += 1
@@ -246,22 +246,27 @@ def main():
                 elif flight_state == "VLA_TRACKING":
                     mode = "VLA_Track"
                     if vla_data:
-                        # 2D 像素誤差映射至 3D 機身姿態誤差 (核心)
                         pixel_x = vla_data.get("pixel_err_x", 0.0)
                         pixel_y = vla_data.get("pixel_err_y", 0.0)
                         area_e = vla_data.get("area_err", 0.0)
+                        raw_area = vla_data.get("raw_area_ratio", 0.0)
 
-                        # 1. Yaw：微調偏航角將目標置中
+                        # 正常追蹤計算 (偏航角與側向平移)
                         target_yaw = yaw - K_VLA_YAW * pixel_x
-                        
-                        # 2. X 軸 (Pitch)：依據面積誤差控制前後距離
-                        err_b_x = K_VLA_FORWARD * area_e
-                        
-                        # 3. Y 軸 (Roll)：輔助側向對齊與抗風擾
                         err_b_y = K_VLA_LATERAL * pixel_x
                         
-                        # 4. Z 軸：高度微調對準樹冠交界
-                        target_z = max(0.5, min(TARGET_Z - K_VLA_ALTITUDE * pixel_y, 4.0))
+                        # [修改] 高度動態微調與硬性包絡線限幅
+                        raw_target_z = TARGET_Z - K_VLA_ALTITUDE * pixel_y
+                        target_z = float(np.clip(raw_target_z, MIN_Z_LIMIT, MAX_Z_LIMIT))
+
+                        # [新增] 視覺防撞緊急後退機制
+                        if raw_area > MAX_SAFE_AREA:
+                            print(f"⚠️ [防撞警告] 畫面佔比 {raw_area*100:.1f}% 達危險距離！觸發緊急後退。")
+                            # 強制覆寫 X 軸誤差，透過模糊控制器轉化為強烈的後退 Pitch
+                            err_b_x = EMERGENCY_BACKWARD_ERR 
+                        else:
+                            # 正常距離保持 (依據 area_e 前進或後退)
+                            err_b_x = K_VLA_FORWARD * area_e
 
                     if vla_state == "TRANSITION":
                         flight_state = "VLA_TRANSITION"
@@ -275,9 +280,8 @@ def main():
 
                 elif flight_state == "VLA_TRANSITION":
                     mode = "VLA_Trans"
-                    # 在跨樹轉換時，不控制 Pitch (err_b_x = 0)，強制 Roll 輸出側向移動
                     err_b_x = 0.0 
-                    err_b_y = -TRANSITION_SPEED * dt # 強制側風位移誤差，使控制器產生對應 Roll
+                    err_b_y = -TRANSITION_SPEED * dt
                     
                     if vla_state == "TRACKING" and (curr_time - transition_start_time > 2.0):
                         flight_state = "VLA_TRACKING"
@@ -296,7 +300,7 @@ def main():
                     if dist_home < 0.40:
                         flight_state = "LAND"
                         transition_start_time = curr_time
-                        print("\n🛬 抵達 TurtleBot 4 (Home) 正上方，啟動降落...")
+                        print("\n🛬 抵達起飛點正上方，啟動降落...")
 
                 elif flight_state == "LAND":
                     mode = "Land"
@@ -305,6 +309,14 @@ def main():
                     err_b_y = -err_w_x * math.sin(yaw) + err_w_y * math.cos(yaw)
                     t_land = curr_time - transition_start_time
                     target_z = max(0.0, TARGET_Z - LANDING_SPEED * t_land)
+                    
+                # 👉 這裡加入第 3 點：看門狗安全覆寫 (Watchdog Failsafe Override)
+                if flight_state in ["VLA_TRACKING", "VLA_TRANSITION", "VLA_SEARCH"]:
+                    if (curr_time - last_vla_recv_time) > VLA_TIMEOUT_LIMIT:
+                        print(f"🚨 [安全警告] VLA 推論超時 (> {VLA_TIMEOUT_LIMIT}s)！強制介入，維持原地懸停。")
+                        err_b_x = 0.0
+                        err_b_y = 0.0
+                        target_yaw = yaw
 
                 # ==========================================
                 # 控制量計算 (直接將機身誤差代入區間二型模糊歸屬函數)
@@ -312,7 +324,6 @@ def main():
                 u_accel, trig_z = alt_ctrl.update(np.array([z, vz], dtype=float), target_z, dt)
                 thrust_cmd = float(np.clip((HOVER_THRUST + u_accel * THRUST_SCALE) / max(math.cos(last_cmd_roll) * math.cos(last_cmd_pitch), 0.5), THR_MIN, THR_MAX))
                 
-                # 將映射好的機身體系誤差送入模糊網路控制器
                 u_pitch, trig_x = etm_pos_x.update(err_b_x, err_b_vx, dt, curr_time)
                 u_roll, trig_y = etm_pos_y.update(err_b_y, err_b_vy, dt, curr_time)
 
@@ -322,7 +333,6 @@ def main():
                 
                 is_triggered = int(trig_x or trig_y or trig_z)
                 if is_triggered or (curr_time - last_send_time > 0.4):
-                    # 傳送 R, P, Yaw, Thrust
                     sock_send.sendto(struct.pack("<4fd", target_roll, target_pitch, target_yaw, thrust_cmd, curr_time), (PI_IP, UDP_SEND_PORT))
                     last_send_time = curr_time
 
@@ -335,7 +345,7 @@ def main():
                           f"CMD R/P/Y({math.degrees(target_roll):+3.0f}°,{math.degrees(target_pitch):+3.0f}°,{math.degrees(target_yaw):+3.0f}°) | {trig_str}")
 
                 if flight_state == "LAND" and target_z <= 0.0 and z < 0.25:
-                    print("\n[Ground Controller] 已降落於移動載具，馬達全數鎖定！")
+                    print("\n[Ground Controller] 已降落，馬達全數鎖定！")
                     stop_msg = struct.pack("<4fd", 0.0, 0.0, 0.0, 0.0, time.time())
                     for _ in range(10):
                         sock_send.sendto(stop_msg, (PI_IP, UDP_SEND_PORT))
@@ -347,8 +357,9 @@ def main():
     finally:
         sock_recv.close()
         sock_send.close()
+        sock_vla.close()
         if log_data:
-            fname = f"vla_generalization_log_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+            fname = f"vla_udp_generalization_log_{time.strftime('%Y%m%d_%H%M%S')}.csv"
             with open(fname, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(['Time', 'X', 'Y', 'Z', 'Err_B_X', 'Err_B_Y', 'Tgt_Z', 'Triggered', 'State'])
